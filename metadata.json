@@ -1,0 +1,59 @@
+{
+  "name": "oxo-flow-methylseq",
+  "title": "nf-core methylseq (port)",
+  "engine": "oxo-flow",
+  "source": {
+    "repo": "nf-core/methylseq",
+    "url": "https://github.com/nf-core/methylseq",
+    "tag": "4.2.0",
+    "sha": "5aa56467a85a5e2d6795ea72dfa5a5f0c9babc23",
+    "license": "MIT"
+  },
+  "created": "2026-08-15",
+  "domain": "genomics",
+  "tags": ["bisulfite-seq", "wgbs", "dna-methylation", "bismark", "nf-core"],
+  "description": "oxo-flow port of the nf-core/methylseq pipeline (default paired-end bismark path): FastQC, TrimGalore, Bismark (bowtie2) alignment, deduplication, samtools sort/index, per-context methylation extraction with bedGraph and coverage output, bismark2report/bismark2summary HTML reports, and a final MultiQC report.",
+  "scope": [
+    "bismark_genomepreparation",
+    "fastqc",
+    "trimgalore",
+    "bismark_align",
+    "bismark_deduplicate",
+    "samtools_sort",
+    "samtools_index",
+    "bismark_methylationextractor",
+    "bismark_coverage2cytosine",
+    "bismark_report",
+    "bismark_summary",
+    "multiqc_versions",
+    "multiqc"
+  ],
+  "excluded": [
+    "single_end — paired-end only; the upstream samplesheet 'single_end' column is not ported",
+    "bwameth (bwa-meth) aligner — non-default aligner branch, not ported",
+    "bwamem aligner — non-default aligner branch, not ported",
+    "bismark_hisat aligner — non-default aligner branch, not ported",
+    "BAM_TAPS_CONVERSION (rastair) — taps/bwamem branch, off by default",
+    "BAM_METHYLDACKEL — bwameth branch, off by default",
+    "QUALIMAP_BAMQC — --run_qualimap branch, off by default",
+    "PRESEQ_LCEXTRAP — --run_preseq branch, off by default",
+    "TARGETED_SEQUENCING (+ PICARD_MARKDUPLICATES, PICARD_ADDORREPLACEREADGROUPS) — --run_targeted_sequencing branch, off by default",
+    "CAT_FASTQ — only active for samples with more than one fastq pair; fixture samplesheets have one pair per sample",
+    "GUNZIP / UNTAR — only active when a prebuilt --bismark_index is supplied; the port always builds the index from the reference FASTA (upstream default)"
+  ],
+  "rule_count": 13,
+  "tools": [
+    "fastqc@0.12.1",
+    "trim-galore@0.6.10",
+    "cutadapt@4.9",
+    "pigz@2.8",
+    "bismark@0.25.1",
+    "samtools@1.22.1",
+    "htslib@1.22.1",
+    "multiqc@1.32"
+  ],
+  "status": "ready",
+  "repo_url": "https://github.com/oxo-flow-community/oxo-flow-methylseq",
+  "site_page": "https://oxo-flow-community.github.io/oxo-flow-methylseq/",
+  "upstream_license": "MIT"
+}

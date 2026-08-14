@@ -1,0 +1,10 @@
+# Environment for samtools sort/index — pinned exactly to the upstream
+# nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/samtools/sort/environment.yml).
+name: samtools
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::htslib=1.22.1
+  - bioconda::samtools=1.22.1

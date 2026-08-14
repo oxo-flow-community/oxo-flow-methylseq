@@ -1,0 +1,8 @@
+# Environment for MultiQC — pinned exactly to the upstream nf-core/methylseq
+# 4.2.0 module environment (modules/nf-core/multiqc/environment.yml).
+name: multiqc
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::multiqc=1.32

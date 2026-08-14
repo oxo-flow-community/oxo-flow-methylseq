@@ -1,0 +1,10 @@
+# Environment for TrimGalore — pinned exactly to the upstream nf-core/methylseq 4.2.0
+# module environment (modules/nf-core/trimgalore/environment.yml).
+name: trimgalore
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::cutadapt=4.9
+  - bioconda::trim-galore=0.6.10
+  - conda-forge::pigz=2.8

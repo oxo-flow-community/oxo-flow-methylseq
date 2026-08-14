@@ -1,0 +1,10 @@
+# Environment for Bismark (genome preparation, alignment, deduplication,
+# methylation extraction, coverage2cytosine, report, summary) — pinned exactly
+# to the upstream nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/bismark/*/environment.yml).
+name: bismark
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::bismark=0.25.1

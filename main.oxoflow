@@ -1,0 +1,670 @@
+# oxo-flow port of nf-core/methylseq 4.2.0 (default-parameters main path).
+#
+# Upstream: https://github.com/nf-core/methylseq @ 4.2.0
+#   (sha 5aa56467a85a5e2d6795ea72dfa5a5f0c9babc23)
+# Default path: FastQC -> TrimGalore -> Bismark align -> dedup ->
+#   samtools sort/index -> methylation extract -> bismark report/summary -> MultiQC.
+# Genome preparation (bismark_genome_preparation, bowtie2) runs first when no
+# prebuilt Bismark index is supplied, exactly like the upstream default.
+#
+# Fidelity notes:
+# - Commands mirror the upstream modules byte-for-byte under default params
+#   (default flag values are reproduced with bash conditionals driven by the
+#   same [config] keys the upstream `params.*` expose).
+# - Upstream process labels (cpus/memory/time) are baked into [rules.resources].
+# - Paired-end only (upstream `single_end` samplesheet column is not ported).
+# - The Bismark index is always built from the reference FASTA (upstream
+#   default when no --bismark_index is given); prebuilt-index shortcuts
+#   (untar/gunzip of supplied indices) are not ported.
+
+[workflow]
+name = "oxo-flow-methylseq"
+version = "1.0.0"
+description = "Bisulfite methylation analysis with Bismark: FastQC, TrimGalore, Bismark alignment + deduplication, methylation extraction, bismark2report/bismark2summary, MultiQC"
+author = "oxo-flow-community"
+sample_group_name = "cohort"
+
+[config]
+# Reference genome (upstream: --fasta). Uncompressed FASTA; the port always
+# builds the Bismark index from it (upstream default when --bismark_index is
+# not supplied). Point this at your genome; the repo default ships the tiny
+# test fixture.
+fasta = "test/fixtures/refs/genome.fa"
+# Input reads directory: raw/<sample>_R1.fastq.gz + _R2.fastq.gz (paired-end).
+# The repo default ships the tiny test fixtures; point this at your data.
+raw_dir = "test/fixtures/raw"
+out_dir = "results"
+# Only the 'bismark' (bowtie2) aligner is ported. 'bismark_hisat', 'bwameth',
+# 'bwamem' are NOT ported (see README fidelity table).
+aligner = "bismark"
+# Skip options (upstream: --skip_fastqc / --skip_trimming / --skip_deduplication /
+# --skip_multiqc). Same defaults as upstream.
+skip_fastqc = false
+skip_trimming = false
+skip_deduplication = false
+skip_multiqc = false
+# Library presets (upstream params with the same defaults).
+rrbs = false
+pbat = false
+single_cell = false
+zymo = false
+accel = false
+em_seq = false
+slamseq = false
+non_directional = false
+# Bismark options
+cytosine_report = false
+nomeseq = false
+comprehensive = false
+meth_cutoff = ""
+no_overlap = true
+ignore_r1 = 0
+ignore_r2 = 2
+ignore_3prime_r1 = 0
+ignore_3prime_r2 = 2
+relax_mismatches = false
+num_mismatches = 0.6
+local_alignment = false
+minins = ""
+maxins = ""
+unmapped = false
+# Trimming options (upstream params with the same defaults)
+clip_r1 = 0
+clip_r2 = 0
+three_prime_clip_r1 = 0
+three_prime_clip_r2 = 0
+nextseq_trim = 0
+length_trim = 0
+skip_trimming_presets = false
+# MultiQC
+multiqc_title = ""
+
+[[sample_groups]]
+name = "cohort"
+samples = ["S1", "S2"]
+
+# ---------------------------------------------------------------------------
+# 1. Reference preparation (upstream: FASTA_INDEX_METHYLSEQ ->
+#    BISMARK_GENOMEPREPARATION_BOWTIE, runs when no --bismark_index is given)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bismark_genomepreparation"
+input = ["{config.fasta}"]
+output = ["refs/BismarkIndex"]
+description = "Build the Bismark (bowtie2) bisulfite genome index from the reference FASTA"
+shell = """
+rm -rf refs/BismarkIndex
+mkdir -p refs/BismarkIndex
+ln -sf "$PWD"/{config.fasta} refs/BismarkIndex/
+bismark_genome_preparation \\
+    --bowtie2 \\
+    refs/BismarkIndex
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "16h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 2. FastQC on raw reads (upstream: FASTQC, label process_medium)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "fastqc"
+input = ["{config.raw_dir}/{sample}_R1.fastq.gz", "{config.raw_dir}/{sample}_R2.fastq.gz"]
+output = [
+    "{config.out_dir}/fastqc/{sample}_1_fastqc.html",
+    "{config.out_dir}/fastqc/{sample}_2_fastqc.html",
+    "{config.out_dir}/fastqc/zips/{sample}_1_fastqc.zip",
+    "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip",
+]
+description = "Run FastQC on the raw reads"
+when = "!config.skip_fastqc"
+shell = """
+# Upstream renames reads to <prefix>_1/2.fastq.gz before QC (consistent MultiQC naming)
+ln -sf {input[0]} {sample}_1.fastq.gz
+ln -sf {input[1]} {sample}_2.fastq.gz
+# --memory = task.memory (36G) / task.cpus (6) in MB, clamped to 100-10000
+fastqc \\
+    --quiet \\
+    --threads {threads} \\
+    --memory 6144 \\
+    {sample}_1.fastq.gz \\
+    {sample}_2.fastq.gz
+mv {sample}_1_fastqc.html {output[0]}
+mv {sample}_2_fastqc.html {output[1]}
+mv {sample}_1_fastqc.zip {output[2]}
+mv {sample}_2_fastqc.zip {output[3]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/fastqc.yaml"
+
+# ---------------------------------------------------------------------------
+# 3. TrimGalore (upstream: TRIMGALORE, label process_high)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "trimgalore"
+input = ["{config.raw_dir}/{sample}_R1.fastq.gz", "{config.raw_dir}/{sample}_R2.fastq.gz"]
+output = [
+    "{config.out_dir}/trimgalore/{sample}_1_val_1.fq.gz",
+    "{config.out_dir}/trimgalore/{sample}_2_val_2.fq.gz",
+    "{config.out_dir}/trimgalore/logs/{sample}_1.fastq.gz_trimming_report.txt",
+    "{config.out_dir}/trimgalore/logs/{sample}_2.fastq.gz_trimming_report.txt",
+    "{config.out_dir}/trimgalore/fastqc/{sample}_1_val_1_fastqc.html",
+    "{config.out_dir}/trimgalore/fastqc/{sample}_2_val_2_fastqc.html",
+    "{config.out_dir}/trimgalore/fastqc/zips/{sample}_1_val_1_fastqc.zip",
+    "{config.out_dir}/trimgalore/fastqc/zips/{sample}_2_val_2_fastqc.zip",
+]
+description = "Trim adapters with TrimGalore (paired-end, --fastqc)"
+when = "!config.skip_trimming"
+shell = """
+args="--fastqc"
+[ "{config.rrbs}" = "true" ] && args="$args --rrbs"
+[ {config.nextseq_trim} -gt 0 ] && args="$args --nextseq {config.nextseq_trim}"
+[ {config.length_trim} -gt 0 ] && args="$args --length {config.length_trim}"
+# 5' clipping R1 (upstream: clip_r1 > 0, else library preset)
+if [ {config.clip_r1} -gt 0 ]; then
+    args="$args --clip_r1 {config.clip_r1}"
+elif [ "{config.skip_trimming_presets}" != "true" ]; then
+    if [ "{config.pbat}" = "true" ]; then
+        args="$args --clip_r1 8"
+    elif [ "{config.single_cell}" = "true" ]; then
+        args="$args --clip_r1 6"
+    elif [ "{config.accel}" = "true" ] || [ "{config.zymo}" = "true" ] || [ "{config.em_seq}" = "true" ]; then
+        args="$args --clip_r1 10"
+    fi
+fi
+# 5' clipping R2 (paired-end only)
+if [ {config.clip_r2} -gt 0 ]; then
+    args="$args --clip_r2 {config.clip_r2}"
+elif [ "{config.skip_trimming_presets}" != "true" ]; then
+    if [ "{config.pbat}" = "true" ]; then
+        args="$args --clip_r2 8"
+    elif [ "{config.single_cell}" = "true" ]; then
+        args="$args --clip_r2 6"
+    elif [ "{config.zymo}" = "true" ] || [ "{config.em_seq}" = "true" ]; then
+        args="$args --clip_r2 10"
+    elif [ "{config.accel}" = "true" ]; then
+        args="$args --clip_r2 15"
+    fi
+fi
+# 3' clipping R1
+if [ {config.three_prime_clip_r1} -gt 0 ]; then
+    args="$args --three_prime_clip_r1 {config.three_prime_clip_r1}"
+elif [ "{config.skip_trimming_presets}" != "true" ]; then
+    if [ "{config.pbat}" = "true" ]; then
+        args="$args --three_prime_clip_r1 8"
+    elif [ "{config.single_cell}" = "true" ]; then
+        args="$args --three_prime_clip_r1 6"
+    elif [ "{config.accel}" = "true" ] || [ "{config.zymo}" = "true" ] || [ "{config.em_seq}" = "true" ]; then
+        args="$args --three_prime_clip_r1 10"
+    fi
+fi
+# 3' clipping R2 (paired-end only)
+if [ {config.three_prime_clip_r2} -gt 0 ]; then
+    args="$args --three_prime_clip_r2 {config.three_prime_clip_r2}"
+elif [ "{config.skip_trimming_presets}" != "true" ]; then
+    if [ "{config.pbat}" = "true" ]; then
+        args="$args --three_prime_clip_r2 8"
+    elif [ "{config.single_cell}" = "true" ]; then
+        args="$args --three_prime_clip_r2 6"
+    elif [ "{config.accel}" = "true" ] || [ "{config.zymo}" = "true" ] || [ "{config.em_seq}" = "true" ]; then
+        args="$args --three_prime_clip_r2 10"
+    fi
+fi
+# Upstream cores = cpus - 4 (paired-end), clamped to [1, 8]; cpus = 12 -> 8
+cores=$(({threads} - 4))
+[ $cores -lt 1 ] && cores=1
+[ $cores -gt 8 ] && cores=8
+# Soft-links to original fastqs for consistent naming in MultiQC
+ln -sf {input[0]} {sample}_1.fastq.gz
+ln -sf {input[1]} {sample}_2.fastq.gz
+trim_galore \\
+    $args \\
+    --cores $cores \\
+    --paired \\
+    --gzip \\
+    {sample}_1.fastq.gz \\
+    {sample}_2.fastq.gz
+mv {sample}_1_val_1.fq.gz {output[0]}
+mv {sample}_2_val_2.fq.gz {output[1]}
+mv {sample}_1.fastq.gz_trimming_report.txt {output[2]}
+mv {sample}_2.fastq.gz_trimming_report.txt {output[3]}
+mv {sample}_1_val_1_fastqc.html {output[4]}
+mv {sample}_2_val_2_fastqc.html {output[5]}
+mv {sample}_1_val_1_fastqc.zip {output[6]}
+mv {sample}_2_val_2_fastqc.zip {output[7]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "16h"
+
+[rules.environment]
+conda = "envs/trimgalore.yaml"
+
+# ---------------------------------------------------------------------------
+# 4. Bismark alignment (upstream: BISMARK_ALIGN, label process_high)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bismark_align"
+input = [
+    "{config.out_dir}/trimgalore/{sample}_1_val_1.fq.gz",
+    "{config.out_dir}/trimgalore/{sample}_2_val_2.fq.gz",
+    "refs/BismarkIndex",
+]
+output = [
+    "{config.out_dir}/bismark/alignments/{sample}_1_val_1_bismark_bt2_pe.bam",
+    "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt",
+]
+description = "Align trimmed reads with Bismark (bowtie2, paired-end)"
+depends_on = ["bismark_genomepreparation"]
+shell = """
+args="--bowtie2"
+[ "{config.pbat}" = "true" ] && args="$args --pbat"
+if [ "{config.single_cell}" = "true" ] || [ "{config.non_directional}" = "true" ] || [ "{config.zymo}" = "true" ]; then
+    args="$args --non_directional"
+fi
+[ "{config.unmapped}" = "true" ] && args="$args --unmapped"
+[ "{config.relax_mismatches}" = "true" ] && args="$args --score_min L,0,-{config.num_mismatches}"
+[ "{config.local_alignment}" = "true" ] && args="$args --local"
+[ -n "{config.minins}" ] && args="$args --minins {config.minins}"
+if [ -n "{config.maxins}" ]; then
+    args="$args --maxins {config.maxins}"
+elif [ "{config.em_seq}" = "true" ]; then
+    args="$args --maxins 1000"
+fi
+# Upstream --multicore: ccore = min(cpus/3, mem/13GB); rule memory = 72G -> 5
+ccore=$(({threads} / 3))
+[ $ccore -gt 5 ] && ccore=5
+if [ $ccore -gt 1 ]; then
+    args="$args --multicore $ccore"
+fi
+bismark \\
+    -1 {input[0]} \\
+    -2 {input[1]} \\
+    --genome {input[2]} \\
+    --bam \\
+    $args
+mv {sample}_1_val_1_bismark_bt2_pe.bam {output[0]}
+mv {sample}_1_val_1_bismark_bt2_PE_report.txt {output[1]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "192h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 5. Deduplicate alignments (upstream: BISMARK_DEDUPLICATE, label process_high)
+#    Skipped when --skip_deduplication or --rrbs, exactly like upstream.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bismark_deduplicate"
+input = ["{config.out_dir}/bismark/alignments/{sample}_1_val_1_bismark_bt2_pe.bam"]
+output = [
+    "{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bam",
+    "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt",
+]
+description = "Remove PCR duplicates with deduplicate_bismark (paired-end)"
+when = "!config.skip_deduplication && !config.rrbs"
+shell = """
+deduplicate_bismark \\
+    -p \\
+    --bam {input[0]}
+mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bam {output[0]}
+mv {sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt {output[1]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "48h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 6. samtools sort (upstream: SAMTOOLS_SORT, label process_medium;
+#    prefix = <sample>.deduplicated.sorted)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "samtools_sort"
+input = ["{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bam"]
+output = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam"]
+description = "Sort the deduplicated BAM with samtools"
+shell = """
+samtools cat \\
+    {input[0]} \\
+| \\
+samtools sort \\
+    -T {sample}.deduplicated.sorted \\
+    --threads {threads} \\
+    -o {sample}.deduplicated.sorted.bam \\
+    -
+mv {sample}.deduplicated.sorted.bam {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+# ---------------------------------------------------------------------------
+# 7. samtools index (upstream: SAMTOOLS_INDEX, label process_low)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "samtools_index"
+input = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam"]
+output = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam.bai"]
+description = "Index the sorted BAM with samtools"
+shell = """
+samtools \\
+    index \\
+    -@ {threads} \\
+    {input[0]}
+mv {sample}.deduplicated.sorted.bam.bai {output[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+# ---------------------------------------------------------------------------
+# 8. Methylation extraction (upstream: BISMARK_METHYLATIONEXTRACTOR,
+#    label process_high; input = the deduplicated BAM, like upstream)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bismark_methylationextractor"
+input = ["{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bam"]
+output = [
+    "{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_bt2_pe.deduplicated_CpG.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_bt2_pe.deduplicated_CHG.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_bt2_pe.deduplicated_CHH.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz",
+    "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt",
+]
+description = "Extract per-context methylation calls, bedGraph and coverage with bismark_methylation_extractor (paired-end)"
+shell = """
+args=""
+[ "{config.comprehensive}" = "true" ] && args="$args --comprehensive"
+[ -n "{config.meth_cutoff}" ] && args="$args --cutoff {config.meth_cutoff}"
+[ "{config.nomeseq}" = "true" ] && args="$args --CX"
+[ {config.ignore_r1} -gt 0 ] && args="$args --ignore {config.ignore_r1}"
+[ {config.ignore_3prime_r1} -gt 0 ] && args="$args --ignore_3prime {config.ignore_3prime_r1}"
+if [ "{config.no_overlap}" = "true" ]; then
+    args="$args --no_overlap"
+else
+    args="$args --include_overlap"
+fi
+[ {config.ignore_r2} -gt 0 ] && args="$args --ignore_r2 {config.ignore_r2}"
+[ {config.ignore_3prime_r2} -gt 0 ] && args="$args --ignore_3prime_r2 {config.ignore_3prime_r2}"
+# Upstream: --multicore when cpus >= 6 (here 12 -> 4); --buffer_size = mem - 2G (72G -> 70G)
+if [ {threads} -ge 6 ]; then
+    args="$args --multicore $(({threads} / 3))"
+fi
+args="$args --buffer_size 70G"
+bismark_methylation_extractor \\
+    {input[0]} \\
+    --bedGraph \\
+    --counts \\
+    --gzip \\
+    --report \\
+    -p \\
+    $args
+mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.gz {output[0]}
+mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_CpG.txt.gz {output[1]}
+mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_CHG.txt.gz {output[2]}
+mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_CHH.txt.gz {output[3]}
+mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz {output[4]}
+mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt {output[5]}
+mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt {output[6]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "24h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 9. Coverage to cytosine report (upstream: BISMARK_COVERAGE2CYTOSINE,
+#    label process_low). Off by default; runs with --cytosine_report / --nomeseq.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bismark_coverage2cytosine"
+input = [
+    "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz",
+    "refs/BismarkIndex",
+]
+output = [
+    "{config.out_dir}/bismark/coverage2cytosine/reports/{sample}.report.txt.gz",
+    "{config.out_dir}/bismark/coverage2cytosine/summaries/{sample}.cytosine_context_summary.txt",
+    "{config.out_dir}/bismark/coverage2cytosine/coverage/{sample}.cov.gz",
+]
+description = "Convert coverage files to genome-wide cytosine reports (coverage2cytosine)"
+when = "config.cytosine_report || config.nomeseq"
+depends_on = ["bismark_genomepreparation"]
+shell = """
+args=""
+[ "{config.nomeseq}" = "true" ] && args="$args --nome-seq"
+coverage2cytosine \\
+    {input[0]} \\
+    --genome {input[1]} \\
+    --output {sample} \\
+    --gzip \\
+    $args
+mv {sample}.report.txt.gz {output[0]}
+mv {sample}.cytosine_context_summary.txt {output[1]}
+mv {sample}.cov.gz {output[2]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 10. Bismark sample report (upstream: BISMARK_REPORT, label process_low;
+#     runs bismark2report with the four per-sample reports co-located, as in
+#     the upstream workdir)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bismark_report"
+input = [
+    "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt",
+    "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt",
+]
+output = ["{config.out_dir}/bismark/reports/{sample}_1_val_1_bismark_bt2_PE_report.html"]
+description = "Generate the per-sample Bismark HTML report with bismark2report"
+shell = """
+rm -rf report_work/{sample}
+mkdir -p report_work/{sample}
+# Absolute symlink targets: bismark2report searches its working directory
+for f in {input}; do
+    ln -sf "$PWD/$f" report_work/{sample}/
+done
+(cd report_work/{sample} && bismark2report)
+mv report_work/{sample}/{sample}_1_val_1_bismark_bt2_PE_report.html {output[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 11. Bismark summary report (upstream: BISMARK_SUMMARY, label process_low;
+#     gathers all per-sample reports, passes the alignment BAM names)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bismark_summary"
+input = []
+expand_inputs = [
+    { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
+]
+output = [
+    "{config.out_dir}/bismark/summary/bismark_summary_report.html",
+    "{config.out_dir}/bismark/summary/bismark_summary_report.txt",
+]
+description = "Generate the project-wide Bismark summary report with bismark2summary"
+shell = """
+rm -rf summary_work
+mkdir -p summary_work
+# Absolute symlink targets: bismark2summary searches its working directory
+for f in {input}; do
+    ln -sf "$PWD/$f" summary_work/
+done
+# Upstream passes the alignment BAM file names (not the files themselves)
+bams=""
+for s in $(echo {config.samples_list} | tr ',' ' '); do
+    bams="$bams ${s}_1_val_1_bismark_bt2_pe.bam"
+done
+(cd summary_work && bismark2summary $bams)
+mv summary_work/bismark_summary_report.html {output[0]}
+mv summary_work/bismark_summary_report.txt {output[1]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 12. Software versions (upstream: softwareVersionsToYAML + collectFile ->
+#     results/pipeline_info/nf_core_methylseq_software_mqc_versions.yml).
+#     Upstream extracts versions at runtime; the port pins them statically.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "multiqc_versions"
+input = []
+output = ["{config.out_dir}/pipeline_info/nf_core_methylseq_software_mqc_versions.yml"]
+description = "Write the collated software versions file for MultiQC"
+shell = """
+mkdir -p {config.out_dir}/pipeline_info
+cat > {config.out_dir}/pipeline_info/nf_core_methylseq_software_mqc_versions.yml <<'VERSIONS_EOF'
+FASTQC:
+  fastqc: 0.12.1
+TRIMGALORE:
+  trimgalore: 0.6.10
+  cutadapt: 4.9
+  pigz: 2.8
+BISMARK_GENOMEPREPARATION:
+  bismark: 0.25.1
+BISMARK_ALIGN:
+  bismark: 0.25.1
+BISMARK_DEDUPLICATE:
+  bismark: 0.25.1
+SAMTOOLS_SORT:
+  samtools: 1.22.1
+SAMTOOLS_INDEX:
+  samtools: 1.22.1
+BISMARK_METHYLATIONEXTRACTOR:
+  bismark: 0.25.1
+BISMARK_COVERAGE2CYTOSINE:
+  bismark: 0.25.1
+BISMARK_REPORT:
+  bismark: 0.25.1
+BISMARK_SUMMARY:
+  bismark: 0.25.1
+MULTIQC:
+  multiqc: 1.32
+VERSIONS_EOF
+"""
+
+[rules.resources]
+threads = 1
+memory = "1G"
+time_limit = "1h"
+
+# ---------------------------------------------------------------------------
+# 13. MultiQC (upstream: MULTIQC, label process_single)
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "multiqc"
+input = []
+expand_inputs = [
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_1_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}_1.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}_2.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/reports/{sample}_1_val_1_bismark_bt2_PE_report.html", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/summary/bismark_summary_report.html", variables = {} },
+    { pattern = "{config.out_dir}/bismark/summary/bismark_summary_report.txt", variables = {} },
+    { pattern = "{config.out_dir}/pipeline_info/nf_core_methylseq_software_mqc_versions.yml", variables = {} },
+]
+output = [
+    "{config.out_dir}/multiqc/bismark/multiqc_report.html",
+    "{config.out_dir}/multiqc/bismark/multiqc_data/",
+]
+description = "Collate all reports with MultiQC"
+when = "!config.skip_multiqc"
+optional = true
+shell = """
+rm -rf multiqc_work multiqc_data
+mkdir -p multiqc_work
+# Absolute symlink targets: multiqc only scans the staging directory
+for f in {input}; do
+    ln -sf "$PWD/$f" multiqc_work/
+done
+args=""
+[ -n "{config.multiqc_title}" ] && args="--title \"{config.multiqc_title}\""
+multiqc \\
+    --force \\
+    $args \\
+    --config config/multiqc_config.yml \\
+    multiqc_work/
+rm -rf {output[1]}
+mv multiqc_report.html {output[0]}
+mv multiqc_data {output[1]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/multiqc.yaml"
