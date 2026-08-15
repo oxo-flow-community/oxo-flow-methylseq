@@ -1,7 +1,9 @@
 {
   "name": "oxo-flow-methylseq",
-  "title": "nf-core methylseq (port)",
-  "engine": "oxo-flow",
+  "title": "Bisulfite methylation analysis: alignment, methylation calls and QC",
+  "origin": "port",
+  "rating": "verified",
+  "engine": "nextflow",
   "source": {
     "repo": "nf-core/methylseq",
     "url": "https://github.com/nf-core/methylseq",
@@ -12,7 +14,6 @@
   "created": "2026-08-15",
   "domain": "genomics",
   "tags": ["bisulfite-seq", "wgbs", "dna-methylation", "bismark", "nf-core"],
-  "description": "oxo-flow port of the nf-core/methylseq pipeline (default paired-end bismark path): FastQC, TrimGalore, Bismark (bowtie2) alignment, deduplication, samtools sort/index, per-context methylation extraction with bedGraph and coverage output, bismark2report/bismark2summary HTML reports, and a final MultiQC report.",
   "scope": [
     "bismark_genomepreparation",
     "fastqc",
@@ -42,18 +43,20 @@
     "GUNZIP / UNTAR — only active when a prebuilt --bismark_index is supplied; the port always builds the index from the reference FASTA (upstream default)"
   ],
   "rule_count": 13,
-  "tools": [
-    "fastqc@0.12.1",
-    "trim-galore@0.6.10",
-    "cutadapt@4.9",
-    "pigz@2.8",
-    "bismark@0.25.1",
-    "samtools@1.22.1",
-    "htslib@1.22.1",
-    "multiqc@1.32"
-  ],
-  "status": "ready",
+  "tools": ["fastqc", "trim-galore", "cutadapt", "pigz", "bismark", "samtools", "htslib", "multiqc"],
+  "description": "Run end-to-end bisulfite methylation analysis (WGBS, and RRBS-compatible) of paired-end reads: FastQC quality control, TrimGalore adapter trimming, alignment to the bisulfite-converted reference genome with Bismark (bowtie2), PCR-deduplication, samtools sort/index, methylation extraction with per-context (CpG/CHG/CHH) calls plus bedGraph and coverage output, per-sample and project-wide Bismark HTML reports, and a final MultiQC report.",
+  "installation": {
+    "engine": "oxo-flow >= 0.11.0",
+    "toolchain": "conda envs — pinned versions (conda-forge/bioconda)",
+    "requirements": [
+      "reference genome FASTA (uncompressed) — the Bismark bowtie2 index is built automatically on first run; no prebuilt index required",
+      "paired-end raw reads: <dir>/<sample>_R1.fastq.gz and <dir>/<sample>_R2.fastq.gz",
+      "compute: up to 12 CPUs / 72 GB RAM per rule (bismark_genomepreparation, trimgalore, bismark_align, bismark_deduplicate, bismark_methylationextractor)",
+      "conda or mamba to create the pinned per-rule environments",
+      "disk: space in config.out_dir (default results/) for aligned BAMs, methylation calls and reports"
+    ]
+  },
   "repo_url": "https://github.com/oxo-flow-community/oxo-flow-methylseq",
-  "site_page": "https://oxo-flow-community.github.io/oxo-flow-methylseq/",
+  "license": "Apache-2.0",
   "upstream_license": "MIT"
 }
