@@ -46,7 +46,7 @@
   "tools": ["fastqc", "trim-galore", "cutadapt", "pigz", "bismark", "samtools", "htslib", "multiqc"],
   "description": "Run end-to-end bisulfite methylation analysis (WGBS, and RRBS-compatible) of paired-end reads: FastQC quality control, TrimGalore adapter trimming, alignment to the bisulfite-converted reference genome with Bismark (bowtie2), PCR-deduplication, samtools sort/index, methylation extraction with per-context (CpG/CHG/CHH) calls plus bedGraph and coverage output, per-sample and project-wide Bismark HTML reports, and a final MultiQC report.",
   "installation": {
-    "engine": "oxo-flow >= 0.11.0",
+    "engine": "oxo-flow >= 0.12.0",
     "toolchain": "conda envs — pinned versions (conda-forge/bioconda)",
     "requirements": [
       "reference genome FASTA (uncompressed) — the Bismark bowtie2 index is built automatically on first run; no prebuilt index required",
