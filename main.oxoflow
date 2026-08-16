@@ -55,7 +55,10 @@ non_directional = false
 # Bismark options
 cytosine_report = false
 nomeseq = false
-comprehensive = false
+# The port's DAG consumes the merged (--comprehensive) methylation-call
+# outputs, so the default differs from upstream (false): the per-strand
+# split files would leave the declared outputs unmoved.
+comprehensive = true
 meth_cutoff = ""
 no_overlap = true
 ignore_r1 = 0
