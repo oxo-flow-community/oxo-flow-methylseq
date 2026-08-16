@@ -438,9 +438,9 @@ bismark_methylation_extractor \\
     -p \\
     $args
 mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.gz {output[0]}
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_CpG.txt.gz {output[1]}
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_CHG.txt.gz {output[2]}
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_CHH.txt.gz {output[3]}
+mv CpG_context_{sample}_1_val_1_bismark_bt2_pe.deduplicated.txt.gz {output[1]}
+mv CHG_context_{sample}_1_val_1_bismark_bt2_pe.deduplicated.txt.gz {output[2]}
+mv CHH_context_{sample}_1_val_1_bismark_bt2_pe.deduplicated.txt.gz {output[3]}
 mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz {output[4]}
 mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt {output[5]}
 mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt {output[6]}
