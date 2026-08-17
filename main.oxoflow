@@ -378,11 +378,12 @@ input = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam
 output = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam.bai"]
 description = "Index the sorted BAM with samtools"
 shell = """
+# samtools index writes the .bai next to the BAM — which IS the declared
+# output path (a cwd-based mv for it was wrong: live 'cannot stat')
 samtools \\
     index \\
     -@ {threads} \\
     {input[0]}
-mv {sample}.deduplicated.sorted.bam.bai {output[0]}
 """
 
 [rules.resources]
