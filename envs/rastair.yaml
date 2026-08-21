@@ -1,0 +1,9 @@
+# Environment for the rastair TAPS chain (mbias, mbiasparser, call,
+# methylkit) — pinned to the upstream nf-core/methylseq 4.2.0 module
+# environment (subworkflows/nf-core/bam_taps_conversion, rastair modules).
+name: rastair
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::rastair=0.8.2

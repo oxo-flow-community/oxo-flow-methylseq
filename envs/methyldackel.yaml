@@ -1,0 +1,12 @@
+# Environment for MethylDackel (bwameth methylation extraction) and the
+# targeted-sequencing bedtools intersect — pinned to the upstream
+# nf-core/methylseq 4.2.0 module environments
+# (modules/nf-core/methyldackel/extract, modules/nf-core/methyldackel/mbias,
+# modules/nf-core/bedtools/intersect).
+name: methyldackel
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::methyldackel=0.6.1
+  - bioconda::bedtools=2.31.1

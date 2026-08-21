@@ -1,0 +1,17 @@
+# Environment for the bwameth / bwamem chains (index, alignment) — pinned to
+# the upstream nf-core/methylseq 4.2.0 module environments
+# (modules/nf-core/bwameth/index, modules/nf-core/bwameth/align,
+# modules/nf-core/bwa/index, modules/nf-core/bwa/mem). bwameth needs bwa
+# (bisulfite-aware index/align) and samtools (output streaming) at runtime,
+# mirroring the upstream module environment. The bwa-mem2 backend for the
+# bwameth index (use_mem2) is gated on the conda package availability;
+# upstream likewise installs mem2 on demand in the gpu/container paths.
+name: bwameth
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::bwameth=0.2.9
+  - bioconda::bwa=0.7.19
+  - bioconda::samtools=1.22.1
+  - bioconda::htslib=1.22.1

@@ -1,0 +1,16 @@
+# Environment for the Picard rules (markduplicates, addorreplacereadgroups,
+# createsequencedictionary, bedtointervallist, collecthsmetrics) plus the
+# QualiMap bamQC and Preseq lcextrap QC rules — pinned to the upstream
+# nf-core/methylseq 4.2.0 module environments
+# (modules/nf-core/picard/markduplicates, modules/nf-core/picard/addorreplacereadgroups,
+# modules/nf-core/picard/createsequencedictionary, modules/nf-core/picard/bedtointervallist,
+# modules/nf-core/picard/collecthsmetrics, modules/nf-core/qualimap/bamqc,
+# modules/nf-core/preseq/lcextrap).
+name: picard
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::picard=3.4.0
+  - bioconda::qualimap=2.3
+  - bioconda::preseq=3.2.0

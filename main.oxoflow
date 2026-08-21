@@ -34,9 +34,48 @@ fasta = "test/fixtures/refs/genome.fa"
 # The repo default ships the tiny test fixtures; point this at your data.
 raw_dir = "test/fixtures/raw"
 out_dir = "results"
-# Only the 'bismark' (bowtie2) aligner is ported. 'bismark_hisat', 'bwameth',
-# 'bwamem' are NOT ported (see README fidelity table).
+# Aligner (upstream: --aligner): 'bismark' (bowtie2, default), 'bismark_hisat',
+# 'bwameth' or 'bwamem'. Each aligner selects an exclusive chain of rules.
+# The bismark/bismark_hisat chain is live-verified; the bwameth and bwamem
+# chains are DRAFT — ported from upstream 4.2.0 but not yet live-tested
+# (see the DRAFT headers on the rules below).
 aligner = "bismark"
+# Bismark output file-name suffix. Bismark names its alignments by aligner:
+# bowtie2 -> *_bismark_bt2_pe, hisat2 -> *_bismark_hisat2_pe. Keep in sync
+# with aligner (upstream hardcodes the token per aligner; the port
+# parameterizes it so one chain serves both).
+align_suffix = "bt2"
+# TAPS protocol (upstream: --taps): run the rastair C->T conversion chain on
+# the alignments. Upstream recommends aligner = bwamem for TAPS; the port
+# wires the rastair chain to the bwamem chain's BAM only.
+taps = false
+# hisat2 splice-site annotations (upstream: --known_splices; bismark_hisat only)
+known_splices = ""
+# bwameth index via bwa-mem2 (upstream: --use_mem2)
+use_mem2 = false
+# MethylDackel options (bwameth chain; upstream params of the same names)
+min_depth = 0
+all_contexts = false
+merge_context = false
+methyl_kit = false
+ignore_flags = false
+# rastair call trimming (upstream: --trim_OT / --trim_OB; format
+# r1_start,r1_end,r2_start,r2_end). Fallback when the mbias parser yields no
+# values; the values parsed from the M-bias plot take precedence.
+trim_ot = "0,0,10,0"
+trim_ob = "0,0,10,0"
+# QualiMap / Preseq QC (upstream: --run_qualimap / --run_preseq, off by default)
+run_qualimap = false
+bamqc_regions_file = ""
+run_preseq = false
+# Targeted sequencing (upstream: --run_targeted_sequencing / --target_regions_file /
+# --collecthsmetrics, off by default). The repo default ships a tiny target
+# BED fixture covering the whole test chromosome. Upstream hard-errors on
+# taps/bwamem with this option; the port's when-gates leave the targeted
+# chain inactive instead (declared outputs are then missing).
+run_targeted_sequencing = false
+target_regions_file = "test/fixtures/targets/targets.bed"
+collecthsmetrics = false
 # Skip options (upstream: --skip_fastqc / --skip_trimming / --skip_deduplication /
 # --skip_multiqc). Same defaults as upstream.
 skip_fastqc = false
@@ -87,20 +126,24 @@ name = "cohort"
 samples = ["S1", "S2"]
 
 # ---------------------------------------------------------------------------
-# 1. Reference preparation (upstream: FASTA_INDEX_METHYLSEQ ->
-#    BISMARK_GENOMEPREPARATION_BOWTIE, runs when no --bismark_index is given)
+# 1. Reference preparation (upstream: FASTA_INDEX_METHYLSEQ -> per-aligner
+#    index preparation, runs when no prebuilt index is given)
 # ---------------------------------------------------------------------------
 [[rules]]
 name = "bismark_genomepreparation"
 input = ["{config.fasta}"]
 output = ["refs/BismarkIndex"]
-description = "Build the Bismark (bowtie2) bisulfite genome index from the reference FASTA"
+description = "Build the Bismark bisulfite genome index (--bowtie2, or --hisat2 with aligner = bismark_hisat; --slam for slamseq)"
+when = "config.aligner == 'bismark' || config.aligner == 'bismark_hisat'"
 shell = """
 rm -rf refs/BismarkIndex
 mkdir -p refs/BismarkIndex
 ln -sf "$PWD"/{config.fasta} refs/BismarkIndex/
+args="--bowtie2"
+[ "{config.aligner}" = "bismark_hisat" ] && args="--hisat2"
+[ "{config.slamseq}" = "true" ] && args="$args --slam"
 bismark_genome_preparation \\
-    --bowtie2 \\
+    $args \\
     refs/BismarkIndex
 """
 
@@ -111,6 +154,136 @@ time_limit = "16h"
 
 [rules.environment]
 conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 1b. bwameth index (upstream: BWAMETH_INDEX, label process_high; bwameth
+#     chain, aligner = bwameth). DRAFT — ported from upstream 4.2.0, not yet
+#     live-tested. bwameth.py writes the converted-reference index files next
+#     to the FASTA inside the index directory; the align rule re-links the
+#     original FASTA there (the upstream symlink dance).
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bwameth_index"
+input = ["{config.fasta}"]
+output = ["refs/bwamethIndex"]
+description = "Build the bwameth (bwa-meth) bisulfite index from the reference FASTA (DRAFT)"
+when = "config.aligner == 'bwameth'"
+shell = """
+rm -rf refs/bwamethIndex
+mkdir -p refs/bwamethIndex
+ln -sf "$PWD"/{config.fasta} refs/bwamethIndex/
+index_cmd="index"
+[ "{config.use_mem2}" = "true" ] && index_cmd="index-mem2"
+bwameth.py $index_cmd refs/bwamethIndex/$(basename {config.fasta})
+# Upstream removes the staged FASTA copy after indexing (the align rule
+# re-links it); keep the converted-reference index files.
+rm refs/bwamethIndex/$(basename {config.fasta})
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "16h"
+
+[rules.environment]
+conda = "envs/bwameth.yaml"
+
+# ---------------------------------------------------------------------------
+# 1b2. bwameth align (upstream: BWAMETH_ALIGN, label process_high, time 6d;
+#      aligner = bwameth). DRAFT. The upstream symlink dance is mirrored here:
+#      bwameth.py needs the ORIGINAL FASTA next to the converted-reference
+#      index files inside the index directory (bwameth_index removes it after
+#      indexing; this rule re-links it). BWA_METH_SKIP_TIME_CHECKS silences the
+#      modification-time warning when the index is older than the FASTA.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bwameth_align"
+input = [
+    "{config.out_dir}/trimgalore/{sample}_1_val_1.fq.gz",
+    "{config.out_dir}/trimgalore/{sample}_2_val_2.fq.gz",
+    "refs/bwamethIndex",
+    "{config.fasta}",
+]
+output = ["{config.out_dir}/bwameth/alignments/{sample}.bam"]
+description = "Align trimmed reads with bwameth (DRAFT; upstream omits the -R read-group tag — the port follows, RG is not set)"
+when = "config.aligner == 'bwameth'"
+depends_on = ["bwameth_index"]
+shell = """
+export BWA_METH_SKIP_TIME_CHECKS=1
+ln -sf "$PWD"/{config.fasta} refs/bwamethIndex/
+bwameth.py \\
+    -t {threads} \\
+    --reference refs/bwamethIndex/$(basename {config.fasta}) \\
+    {input[0]} \\
+    {input[1]} \\
+| \\
+samtools view \\
+    -@ {threads} \\
+    -bhS \\
+    -o {sample}.bam \\
+    -
+mv {sample}.bam {output[0]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "144h"
+
+[rules.environment]
+conda = "envs/bwameth.yaml"
+
+# ---------------------------------------------------------------------------
+# 1c. BWA index (upstream: BWA_INDEX; bwamem chain, aligner = bwamem). DRAFT.
+#     Upstream scales memory with the FASTA size (6 bytes per base); the port
+#     uses the base process default (1 cpu / 6G / 4h).
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bwa_index"
+input = ["{config.fasta}"]
+output = ["refs/bwaIndex"]
+description = "Build the BWA index from the reference FASTA (bwamem chain, DRAFT)"
+when = "config.aligner == 'bwamem'"
+shell = """
+rm -rf refs/bwaIndex
+mkdir -p refs/bwaIndex
+bwa \\
+    index \\
+    -p refs/bwaIndex/$(basename {config.fasta}) \\
+    {config.fasta}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/bwameth.yaml"
+
+# ---------------------------------------------------------------------------
+# 1d. samtools faidx (upstream: SAMTOOLS_FAIDX; runs for aligner bwameth /
+#     bwamem or when collecthsmetrics is on). The .fai is written next to the
+#     reference FASTA — standard samtools behavior; the tiny bundled fixture
+#     genome produces a tiny index.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "samtools_faidx"
+input = ["{config.fasta}"]
+output = ["{config.fasta}.fai"]
+description = "Index the reference FASTA with samtools faidx (required by the bwameth/bwamem chains and Picard CollectHsMetrics)"
+when = "config.aligner == 'bwameth' || config.aligner == 'bwamem' || config.collecthsmetrics"
+shell = """
+samtools faidx {config.fasta}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
 
 # ---------------------------------------------------------------------------
 # 2. FastQC on raw reads (upstream: FASTQC, label process_medium)
@@ -267,16 +440,27 @@ input = [
     "refs/BismarkIndex",
 ]
 output = [
-    "{config.out_dir}/bismark/alignments/{sample}_1_val_1_bismark_bt2_pe.bam",
-    "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt",
+    "{config.out_dir}/bismark/alignments/{sample}_1_val_1_bismark_{config.align_suffix}_pe.bam",
+    "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_{config.align_suffix}_PE_report.txt",
 ]
-description = "Align trimmed reads with Bismark (bowtie2, paired-end)"
+description = "Align trimmed reads with Bismark (bowtie2 or hisat2, paired-end)"
+when = "config.aligner == 'bismark' || config.aligner == 'bismark_hisat'"
 depends_on = ["bismark_genomepreparation"]
 shell = """
-args="--bowtie2"
+args=""
+if [ "{config.aligner}" = "bismark_hisat" ]; then
+    args="--hisat2"
+    if [ -n "{config.known_splices}" ]; then
+        args="$args --known-splicesite-infile <(hisat2_extract_splice_sites.py {config.known_splices})"
+    fi
+else
+    args="--bowtie2"
+fi
 [ "{config.pbat}" = "true" ] && args="$args --pbat"
+nd=0
 if [ "{config.single_cell}" = "true" ] || [ "{config.non_directional}" = "true" ] || [ "{config.zymo}" = "true" ]; then
     args="$args --non_directional"
+    nd=1
 fi
 [ "{config.unmapped}" = "true" ] && args="$args --unmapped"
 [ "{config.relax_mismatches}" = "true" ] && args="$args --score_min L,0,-{config.num_mismatches}"
@@ -287,9 +471,15 @@ if [ -n "{config.maxins}" ]; then
 elif [ "{config.em_seq}" = "true" ]; then
     args="$args --maxins 1000"
 fi
-# Upstream --multicore: ccore = min(cpus/3, mem/13GB); rule memory = 72G -> 5
-ccore=$(({threads} / 3))
-[ $ccore -gt 5 ] && ccore=5
+# Upstream --multicore: ccore = min(cpus/3, mem/13GB); with --non_directional
+# cpus/5 and mem/18GB instead. Rule = 12 cpus / 72G -> 5 (or 4).
+if [ $nd -eq 1 ]; then
+    ccore=$(({threads} / 5))
+    [ $ccore -gt 4 ] && ccore=4
+else
+    ccore=$(({threads} / 3))
+    [ $ccore -gt 5 ] && ccore=5
+fi
 if [ $ccore -gt 1 ]; then
     args="$args --multicore $ccore"
 fi
@@ -299,8 +489,8 @@ bismark \\
     --genome {input[2]} \\
     --bam \\
     $args
-mv {sample}_1_val_1_bismark_bt2_pe.bam {output[0]}
-mv {sample}_1_val_1_bismark_bt2_PE_report.txt {output[1]}
+mv {sample}_1_val_1_bismark_{config.align_suffix}_pe.bam {output[0]}
+mv {sample}_1_val_1_bismark_{config.align_suffix}_PE_report.txt {output[1]}
 """
 
 [rules.resources]
@@ -317,19 +507,19 @@ conda = "envs/bismark.yaml"
 # ---------------------------------------------------------------------------
 [[rules]]
 name = "bismark_deduplicate"
-input = ["{config.out_dir}/bismark/alignments/{sample}_1_val_1_bismark_bt2_pe.bam"]
+input = ["{config.out_dir}/bismark/alignments/{sample}_1_val_1_bismark_{config.align_suffix}_pe.bam"]
 output = [
-    "{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bam",
-    "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt",
+    "{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bam",
+    "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplication_report.txt",
 ]
 description = "Remove PCR duplicates with deduplicate_bismark (paired-end)"
-when = "!config.skip_deduplication && !config.rrbs"
+when = "!config.skip_deduplication && !config.rrbs && (config.aligner == 'bismark' || config.aligner == 'bismark_hisat')"
 shell = """
 deduplicate_bismark \\
     -p \\
     --bam {input[0]}
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bam {output[0]}
-mv {sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt {output[1]}
+mv {sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bam {output[0]}
+mv {sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplication_report.txt {output[1]}
 """
 
 [rules.resources]
@@ -346,9 +536,10 @@ conda = "envs/bismark.yaml"
 # ---------------------------------------------------------------------------
 [[rules]]
 name = "samtools_sort"
-input = ["{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bam"]
+input = ["{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bam"]
 output = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam"]
 description = "Sort the deduplicated BAM with samtools"
+when = "config.aligner == 'bismark' || config.aligner == 'bismark_hisat'"
 shell = """
 samtools cat \\
     {input[0]} \\
@@ -377,6 +568,7 @@ name = "samtools_index"
 input = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam"]
 output = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam.bai"]
 description = "Index the sorted BAM with samtools"
+when = "config.aligner == 'bismark' || config.aligner == 'bismark_hisat'"
 shell = """
 # samtools index writes the .bai next to the BAM — which IS the declared
 # output path (a cwd-based mv for it was wrong: live 'cannot stat')
@@ -400,17 +592,18 @@ conda = "envs/samtools.yaml"
 # ---------------------------------------------------------------------------
 [[rules]]
 name = "bismark_methylationextractor"
-input = ["{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bam"]
+input = ["{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bam"]
 output = [
-    "{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.gz",
-    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_bt2_pe.deduplicated_CpG.txt.gz",
-    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_bt2_pe.deduplicated_CHG.txt.gz",
-    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_bt2_pe.deduplicated_CHH.txt.gz",
-    "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz",
-    "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt",
-    "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt",
+    "{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bedGraph.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated_CpG.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated_CHG.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated_CHH.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bismark.cov.gz",
+    "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated_splitting_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.M-bias.txt",
 ]
 description = "Extract per-context methylation calls, bedGraph and coverage with bismark_methylation_extractor (paired-end)"
+when = "config.aligner == 'bismark' || config.aligner == 'bismark_hisat'"
 shell = """
 args=""
 [ "{config.comprehensive}" = "true" ] && args="$args --comprehensive"
@@ -438,13 +631,13 @@ bismark_methylation_extractor \\
     --report \\
     -p \\
     $args
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.gz {output[0]}
-mv CpG_context_{sample}_1_val_1_bismark_bt2_pe.deduplicated.txt.gz {output[1]}
-mv CHG_context_{sample}_1_val_1_bismark_bt2_pe.deduplicated.txt.gz {output[2]}
-mv CHH_context_{sample}_1_val_1_bismark_bt2_pe.deduplicated.txt.gz {output[3]}
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz {output[4]}
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt {output[5]}
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt {output[6]}
+mv {sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bedGraph.gz {output[0]}
+mv CpG_context_{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.txt.gz {output[1]}
+mv CHG_context_{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.txt.gz {output[2]}
+mv CHH_context_{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.txt.gz {output[3]}
+mv {sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bismark.cov.gz {output[4]}
+mv {sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated_splitting_report.txt {output[5]}
+mv {sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.M-bias.txt {output[6]}
 """
 
 [rules.resources]
@@ -462,7 +655,7 @@ conda = "envs/bismark.yaml"
 [[rules]]
 name = "bismark_coverage2cytosine"
 input = [
-    "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bismark.cov.gz",
     "refs/BismarkIndex",
 ]
 output = [
@@ -471,7 +664,7 @@ output = [
     "{config.out_dir}/bismark/coverage2cytosine/coverage/{sample}.cov.gz",
 ]
 description = "Convert coverage files to genome-wide cytosine reports (coverage2cytosine)"
-when = "config.cytosine_report || config.nomeseq"
+when = "(config.cytosine_report || config.nomeseq) && (config.aligner == 'bismark' || config.aligner == 'bismark_hisat')"
 depends_on = ["bismark_genomepreparation"]
 shell = """
 args=""
@@ -503,13 +696,14 @@ conda = "envs/bismark.yaml"
 [[rules]]
 name = "bismark_report"
 input = [
-    "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt",
-    "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt",
-    "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt",
-    "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt",
+    "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_{config.align_suffix}_PE_report.txt",
+    "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplication_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated_splitting_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.M-bias.txt",
 ]
-output = ["{config.out_dir}/bismark/reports/{sample}_1_val_1_bismark_bt2_PE_report.html"]
+output = ["{config.out_dir}/bismark/reports/{sample}_1_val_1_bismark_{config.align_suffix}_PE_report.html"]
 description = "Generate the per-sample Bismark HTML report with bismark2report"
+when = "config.aligner == 'bismark' || config.aligner == 'bismark_hisat'"
 shell = """
 rm -rf report_work/{sample}
 mkdir -p report_work/{sample}
@@ -518,7 +712,7 @@ for f in {input}; do
     ln -sf "$PWD/$f" report_work/{sample}/
 done
 (cd report_work/{sample} && bismark2report)
-mv report_work/{sample}/{sample}_1_val_1_bismark_bt2_PE_report.html {output[0]}
+mv report_work/{sample}/{sample}_1_val_1_bismark_{config.align_suffix}_PE_report.html {output[0]}
 """
 
 [rules.resources]
@@ -537,16 +731,17 @@ conda = "envs/bismark.yaml"
 name = "bismark_summary"
 input = []
 expand_inputs = [
-    { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt", variables = { sample = "config.samples_list" } },
-    { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt", variables = { sample = "config.samples_list" } },
-    { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
-    { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_{config.align_suffix}_PE_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplication_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
 ]
 output = [
     "{config.out_dir}/bismark/summary/bismark_summary_report.html",
     "{config.out_dir}/bismark/summary/bismark_summary_report.txt",
 ]
 description = "Generate the project-wide Bismark summary report with bismark2summary"
+when = "config.aligner == 'bismark' || config.aligner == 'bismark_hisat'"
 shell = """
 rm -rf summary_work
 mkdir -p summary_work
@@ -557,7 +752,7 @@ done
 # Upstream passes the alignment BAM file names (not the files themselves)
 bams=""
 for s in $(echo {config.samples_list} | tr ',' ' '); do
-    bams="$bams ${s}_1_val_1_bismark_bt2_pe.bam"
+    bams="$bams ${s}_1_val_1_bismark_{config.align_suffix}_pe.bam"
 done
 (cd summary_work && bismark2summary $bams)
 mv summary_work/bismark_summary_report.html {output[0]}
@@ -571,6 +766,1143 @@ time_limit = "4h"
 
 [rules.environment]
 conda = "envs/bismark.yaml"
+
+# ---------------------------------------------------------------------------
+# 11b. bwameth chain — sort / index / flagstat / stats (upstream:
+#      FASTQ_ALIGN_DEDUP_BWAMETH; SAMTOOLS_SORT prefix {sample}.sorted).
+#      DRAFT — ported from upstream 4.2.0, not yet live-tested.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bwameth_samtools_sort"
+input = ["{config.out_dir}/bwameth/alignments/{sample}.bam"]
+output = ["{config.out_dir}/bwameth/alignments/{sample}.sorted.bam"]
+description = "Sort the bwameth-aligned BAM with samtools (DRAFT)"
+when = "config.aligner == 'bwameth'"
+shell = """
+samtools cat \\
+    {input[0]} \\
+| \\
+samtools sort \\
+    -T {sample}.sorted \\
+    --threads {threads} \\
+    -o {sample}.sorted.bam \\
+    -
+mv {sample}.sorted.bam {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bwameth_samtools_index"
+input = ["{config.out_dir}/bwameth/alignments/{sample}.sorted.bam"]
+output = ["{config.out_dir}/bwameth/alignments/{sample}.sorted.bam.bai"]
+description = "Index the sorted bwameth BAM with samtools (DRAFT)"
+when = "config.aligner == 'bwameth'"
+shell = """
+# samtools index writes the .bai next to the BAM, which is the declared output
+samtools \\
+    index \\
+    -@ {threads} \\
+    {input[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bwameth_samtools_flagstat"
+input = [
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam",
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam.bai",
+]
+output = ["{config.out_dir}/bwameth/alignments/samtools_stats/{sample}.sorted.flagstat"]
+description = "Run samtools flagstat on the bwameth alignment (DRAFT)"
+when = "config.aligner == 'bwameth'"
+shell = """
+samtools \\
+    flagstat \\
+    --threads {threads} \\
+    {input[0]} \\
+    > {sample}.sorted.flagstat
+mv {sample}.sorted.flagstat {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bwameth_samtools_stats"
+input = [
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam",
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam.bai",
+]
+output = ["{config.out_dir}/bwameth/alignments/samtools_stats/{sample}.sorted.stats"]
+description = "Run samtools stats on the bwameth alignment (DRAFT; upstream passes no reference)"
+when = "config.aligner == 'bwameth'"
+shell = """
+samtools \\
+    stats \\
+    --threads {threads} \\
+    {input[0]} \\
+    > {sample}.sorted.stats
+mv {sample}.sorted.stats {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+# ---------------------------------------------------------------------------
+# 11c. bwameth deduplication + MethylDackel (upstream: PICARD_MARKDUPLICATES
+#      prefix {sample}.markdup.sorted, then BAM_METHYLDACKEL extract/mbias on
+#      the deduplicated BAM; with skip_deduplication/rrbs the sorted BAM is
+#      used instead — hence the *nodedup* variants). DRAFT rules.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bwameth_picard_markduplicates"
+input = [
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = [
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam",
+    "{config.out_dir}/bwameth/deduplicated/picard_metrics/{sample}.markdup.sorted.MarkDuplicates.metrics.txt",
+]
+description = "Mark duplicates with Picard MarkDuplicates (bwameth chain, DRAFT)"
+when = "config.aligner == 'bwameth' && !config.skip_deduplication && !config.rrbs"
+shell = """
+mkdir -p tmp
+picard \\
+    -Xmx29491M \\
+    MarkDuplicates \\
+    --ASSUME_SORTED true \\
+    --REMOVE_DUPLICATES false \\
+    --VALIDATION_STRINGENCY LENIENT \\
+    --PROGRAM_RECORD_ID 'null' \\
+    --TMP_DIR tmp \\
+    --INPUT {input[0]} \\
+    --OUTPUT {sample}.markdup.sorted.bam \\
+    --REFERENCE_SEQUENCE {input[1]} \\
+    --METRICS_FILE {sample}.markdup.sorted.MarkDuplicates.metrics.txt
+mv {sample}.markdup.sorted.bam {output[0]}
+mv {sample}.markdup.sorted.MarkDuplicates.metrics.txt {output[1]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "bwameth_samtools_index_dedup"
+input = ["{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam"]
+output = ["{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam.bai"]
+description = "Index the deduplicated bwameth BAM with samtools (DRAFT)"
+when = "config.aligner == 'bwameth' && !config.skip_deduplication && !config.rrbs"
+shell = """
+# samtools index writes the .bai next to the BAM, which is the declared output
+samtools \\
+    index \\
+    -@ {threads} \\
+    {input[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "methyldackel_extract"
+input = [
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam",
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam.bai",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = ["{config.out_dir}/methyldackel/{sample}.markdup.sorted_CpG.bedGraph"]
+description = "Extract methylation calls with MethylDackel (bwameth chain, DRAFT; output named from the BAM baseName)"
+when = "config.aligner == 'bwameth' && !config.taps && !config.methyl_kit && !config.skip_deduplication && !config.rrbs"
+shell = """
+args=""
+[ "{config.all_contexts}" = "true" ] && args="$args --CHG --CHH"
+[ "{config.merge_context}" = "true" ] && args="$args --mergeContext"
+[ "{config.ignore_flags}" = "true" ] && args="$args --ignoreFlags"
+[ {config.min_depth} -gt 0 ] && args="$args --minDepth {config.min_depth}"
+MethylDackel extract \\
+    $args \\
+    {config.fasta} \\
+    {input[0]}
+mv {sample}.markdup.sorted_CpG.bedGraph {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/methyldackel.yaml"
+
+[[rules]]
+name = "methyldackel_extract_nodedup"
+input = [
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam",
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam.bai",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = ["{config.out_dir}/methyldackel/{sample}.sorted_CpG.bedGraph"]
+description = "Extract methylation calls with MethylDackel from the sorted (non-deduplicated) BAM (bwameth chain, DRAFT)"
+when = "config.aligner == 'bwameth' && !config.taps && !config.methyl_kit && (config.skip_deduplication || config.rrbs)"
+shell = """
+args=""
+[ "{config.all_contexts}" = "true" ] && args="$args --CHG --CHH"
+[ "{config.merge_context}" = "true" ] && args="$args --mergeContext"
+[ "{config.ignore_flags}" = "true" ] && args="$args --ignoreFlags"
+[ {config.min_depth} -gt 0 ] && args="$args --minDepth {config.min_depth}"
+MethylDackel extract \\
+    $args \\
+    {config.fasta} \\
+    {input[0]}
+mv {sample}.sorted_CpG.bedGraph {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/methyldackel.yaml"
+
+[[rules]]
+name = "methyldackel_extract_methylkit"
+input = [
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam",
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam.bai",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = ["{config.out_dir}/methyldackel/{sample}.markdup.sorted_CpG.methylKit"]
+description = "Extract methylation calls with MethylDackel in methylKit format (bwameth chain, DRAFT)"
+when = "config.aligner == 'bwameth' && !config.taps && config.methyl_kit && !config.skip_deduplication && !config.rrbs"
+shell = """
+args="--methylKit"
+[ "{config.all_contexts}" = "true" ] && args="$args --CHG --CHH"
+[ "{config.merge_context}" = "true" ] && args="$args --mergeContext"
+[ "{config.ignore_flags}" = "true" ] && args="$args --ignoreFlags"
+[ {config.min_depth} -gt 0 ] && args="$args --minDepth {config.min_depth}"
+MethylDackel extract \\
+    $args \\
+    {config.fasta} \\
+    {input[0]}
+mv {sample}.markdup.sorted_CpG.methylKit {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/methyldackel.yaml"
+
+[[rules]]
+name = "methyldackel_extract_methylkit_nodedup"
+input = [
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam",
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam.bai",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = ["{config.out_dir}/methyldackel/{sample}.sorted_CpG.methylKit"]
+description = "Extract methylation calls with MethylDackel in methylKit format from the sorted (non-deduplicated) BAM (bwameth chain, DRAFT)"
+when = "config.aligner == 'bwameth' && !config.taps && config.methyl_kit && (config.skip_deduplication || config.rrbs)"
+shell = """
+args="--methylKit"
+[ "{config.all_contexts}" = "true" ] && args="$args --CHG --CHH"
+[ "{config.merge_context}" = "true" ] && args="$args --mergeContext"
+[ "{config.ignore_flags}" = "true" ] && args="$args --ignoreFlags"
+[ {config.min_depth} -gt 0 ] && args="$args --minDepth {config.min_depth}"
+MethylDackel extract \\
+    $args \\
+    {config.fasta} \\
+    {input[0]}
+mv {sample}.sorted_CpG.methylKit {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/methyldackel.yaml"
+
+[[rules]]
+name = "methyldackel_mbias"
+input = [
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam",
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam.bai",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = ["{config.out_dir}/methyldackel/mbias/{sample}.markdup.sorted.mbias.txt"]
+description = "Compute the M-bias with MethylDackel mbias (bwameth chain, DRAFT)"
+when = "config.aligner == 'bwameth' && !config.taps && !config.skip_deduplication && !config.rrbs"
+shell = """
+args=""
+[ "{config.all_contexts}" = "true" ] && args="$args --CHG --CHH"
+[ "{config.ignore_flags}" = "true" ] && args="$args --ignoreFlags"
+MethylDackel mbias \\
+    $args \\
+    {config.fasta} \\
+    {input[0]} \\
+    {sample}.markdup.sorted \\
+    --txt \\
+    > {sample}.markdup.sorted.mbias.txt
+mv {sample}.markdup.sorted.mbias.txt {output[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/methyldackel.yaml"
+
+[[rules]]
+name = "methyldackel_mbias_nodedup"
+input = [
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam",
+    "{config.out_dir}/bwameth/alignments/{sample}.sorted.bam.bai",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = ["{config.out_dir}/methyldackel/mbias/{sample}.sorted.mbias.txt"]
+description = "Compute the M-bias with MethylDackel mbias from the sorted (non-deduplicated) BAM (bwameth chain, DRAFT)"
+when = "config.aligner == 'bwameth' && !config.taps && (config.skip_deduplication || config.rrbs)"
+shell = """
+args=""
+[ "{config.all_contexts}" = "true" ] && args="$args --CHG --CHH"
+[ "{config.ignore_flags}" = "true" ] && args="$args --ignoreFlags"
+MethylDackel mbias \\
+    $args \\
+    {config.fasta} \\
+    {input[0]} \\
+    {sample}.sorted \\
+    --txt \\
+    > {sample}.sorted.mbias.txt
+mv {sample}.sorted.mbias.txt {output[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/methyldackel.yaml"
+
+# ---------------------------------------------------------------------------
+# 11d. bwamem chain — align, sort, index, stats (upstream: FASTQ_ALIGN_BWA
+#      with sort_bam = true, then BAM_SORT_STATS_SAMTOOLS; SAMTOOLS_SORT
+#      prefix {sample}.sorted). DRAFT rules.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bwa_mem"
+input = [
+    "{config.out_dir}/trimgalore/{sample}_1_val_1.fq.gz",
+    "{config.out_dir}/trimgalore/{sample}_2_val_2.fq.gz",
+    "refs/bwaIndex",
+]
+output = ["{config.out_dir}/bwamem/alignments/{sample}.bam"]
+description = "Align trimmed reads with bwa mem (sort_bam = true; bwamem chain, DRAFT)"
+when = "config.aligner == 'bwamem'"
+depends_on = ["bwa_index"]
+shell = """
+INDEX=$(find -L refs/bwaIndex -name '*.amb' | sed 's/\\.amb$//')
+bwa mem \\
+    -t {threads} \\
+    $INDEX \\
+    {input[0]} \\
+    {input[1]} \\
+| \\
+samtools sort \\
+    --threads {threads} \\
+    -o {sample}.bam \\
+    -
+mv {sample}.bam {output[0]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "16h"
+
+[rules.environment]
+conda = "envs/bwameth.yaml"
+
+[[rules]]
+name = "bwamem_samtools_sort"
+input = ["{config.out_dir}/bwamem/alignments/{sample}.bam"]
+output = ["{config.out_dir}/bwamem/alignments/{sample}.sorted.bam"]
+description = "Sort the bwamem-aligned BAM with samtools (DRAFT)"
+when = "config.aligner == 'bwamem'"
+shell = """
+samtools cat \\
+    {input[0]} \\
+| \\
+samtools sort \\
+    -T {sample}.sorted \\
+    --threads {threads} \\
+    -o {sample}.sorted.bam \\
+    -
+mv {sample}.sorted.bam {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bwamem_samtools_index"
+input = ["{config.out_dir}/bwamem/alignments/{sample}.sorted.bam"]
+output = ["{config.out_dir}/bwamem/alignments/{sample}.sorted.bam.bai"]
+description = "Index the sorted bwamem BAM with samtools (DRAFT)"
+when = "config.aligner == 'bwamem'"
+shell = """
+# samtools index writes the .bai next to the BAM, which is the declared output
+samtools \\
+    index \\
+    -@ {threads} \\
+    {input[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bwamem_samtools_stats"
+input = [
+    "{config.out_dir}/bwamem/alignments/{sample}.sorted.bam",
+    "{config.out_dir}/bwamem/alignments/{sample}.sorted.bam.bai",
+]
+output = ["{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.sorted.stats"]
+description = "Run samtools stats on the bwamem alignment (DRAFT; upstream passes no reference)"
+when = "config.aligner == 'bwamem'"
+shell = """
+samtools \\
+    stats \\
+    --threads {threads} \\
+    {input[0]} \\
+    > {sample}.sorted.stats
+mv {sample}.sorted.stats {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bwamem_samtools_flagstat"
+input = [
+    "{config.out_dir}/bwamem/alignments/{sample}.sorted.bam",
+    "{config.out_dir}/bwamem/alignments/{sample}.sorted.bam.bai",
+]
+output = ["{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.sorted.flagstat"]
+description = "Run samtools flagstat on the bwamem alignment (DRAFT)"
+when = "config.aligner == 'bwamem'"
+shell = """
+samtools \\
+    flagstat \\
+    --threads {threads} \\
+    {input[0]} \\
+    > {sample}.sorted.flagstat
+mv {sample}.sorted.flagstat {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bwamem_samtools_idxstats"
+input = [
+    "{config.out_dir}/bwamem/alignments/{sample}.sorted.bam",
+    "{config.out_dir}/bwamem/alignments/{sample}.sorted.bam.bai",
+]
+output = ["{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.sorted.idxstats"]
+description = "Run samtools idxstats on the bwamem alignment (DRAFT)"
+when = "config.aligner == 'bwamem'"
+shell = """
+# --threads is the number of ADDITIONAL CPUs (upstream: cpus - 1)
+samtools \\
+    idxstats \\
+    --threads $(({threads} - 1)) \\
+    {input[0]} \\
+    > {sample}.sorted.idxstats
+mv {sample}.sorted.idxstats {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+# ---------------------------------------------------------------------------
+# 11e. bwamem deduplication (upstream: PICARD_ADDORREPLACEREADGROUPS prefix
+#      {sample}, then PICARD_MARKDUPLICATES prefix {sample}.markdup.sorted;
+#      both skipped with skip_deduplication). DRAFT rules.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bwamem_picard_addorreplacereadgroups"
+input = [
+    "{config.out_dir}/bwamem/alignments/{sample}.sorted.bam",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = ["{config.out_dir}/bwamem/deduplicated/{sample}.bam"]
+description = "Add read groups with Picard AddOrReplaceReadGroups (bwamem chain, DRAFT; upstream does not publish this intermediate BAM)"
+when = "config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+picard \\
+    -Xmx9830M \\
+    AddOrReplaceReadGroups \\
+    --RGID 1 \\
+    --RGLB lib1 \\
+    --RGPL illumina \\
+    --RGPU unit1 \\
+    --RGSM sample1 \\
+    --REFERENCE_SEQUENCE {input[1]} \\
+    --INPUT {input[0]} \\
+    --OUTPUT {sample}.bam
+mv {sample}.bam {output[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "bwamem_picard_markduplicates"
+input = [
+    "{config.out_dir}/bwamem/deduplicated/{sample}.bam",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = [
+    "{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam",
+    "{config.out_dir}/bwamem/deduplicated/picard_metrics/{sample}.markdup.sorted.MarkDuplicates.metrics.txt",
+]
+description = "Mark duplicates with Picard MarkDuplicates (bwamem chain, DRAFT)"
+when = "config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+mkdir -p tmp
+picard \\
+    -Xmx29491M \\
+    MarkDuplicates \\
+    --ASSUME_SORTED true \\
+    --REMOVE_DUPLICATES false \\
+    --VALIDATION_STRINGENCY LENIENT \\
+    --PROGRAM_RECORD_ID 'null' \\
+    --TMP_DIR tmp \\
+    --INPUT {input[0]} \\
+    --OUTPUT {sample}.markdup.sorted.bam \\
+    --REFERENCE_SEQUENCE {input[1]} \\
+    --METRICS_FILE {sample}.markdup.sorted.MarkDuplicates.metrics.txt
+mv {sample}.markdup.sorted.bam {output[0]}
+mv {sample}.markdup.sorted.MarkDuplicates.metrics.txt {output[1]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "bwamem_samtools_index_dedup"
+input = ["{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam"]
+output = ["{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam.bai"]
+description = "Index the deduplicated bwamem BAM with samtools (DRAFT)"
+when = "config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+# samtools index writes the .bai next to the BAM, which is the declared output
+samtools \\
+    index \\
+    -@ {threads} \\
+    {input[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+# ---------------------------------------------------------------------------
+# 11f. rastair TAPS chain (upstream: BAM_TAPS_CONVERSION, runs when
+#      taps || aligner == bwamem). DRAFT. The port wires the chain to the
+#      bwamem chain's deduplicated BAM only — upstream recommends bwamem for
+#      TAPS and warns when taps is combined with other aligners, which the
+#      port does not support. With skip_deduplication the rastair inputs are
+#      missing; the chain stays inactive (documented limitation).
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "rastair_mbias"
+input = [
+    "{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam",
+    "{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam.bai",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+]
+output = ["{config.out_dir}/taps/{sample}.rastair_mbias.txt"]
+description = "Assess C->T conversion with rastair mbias (TAPS chain, DRAFT)"
+when = "config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+rastair mbias \\
+    --threads {threads} \\
+    --fasta-file {config.fasta} \\
+    {input[0]} > {sample}.rastair_mbias.txt
+mv {sample}.rastair_mbias.txt {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/rastair.yaml"
+
+[[rules]]
+name = "rastair_mbiasparser"
+input = ["{config.out_dir}/taps/{sample}.rastair_mbias.txt"]
+output = [
+    "{config.out_dir}/taps/{sample}.rastair_mbias_processed.pdf",
+    "{config.out_dir}/taps/{sample}.rastair_mbias_processed.csv",
+    "{config.out_dir}/taps/{sample}.rastair_mbias_processed.txt",
+]
+description = "Plot and parse the rastair M-bias (TAPS chain, DRAFT; upstream hands the parsed trim values to the call rule via channel env — the port re-parses the CSV in rastair_call instead)"
+when = "config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+plot_mbias.R --pdf -o {sample}.rastair_mbias_processed.pdf {input[0]} > {sample}.rastair_mbias_processed.txt
+parse_mbias.R {sample}.rastair_mbias_processed.txt {sample}.rastair_mbias_processed.csv
+mv {sample}.rastair_mbias_processed.pdf {output[0]}
+mv {sample}.rastair_mbias_processed.csv {output[1]}
+mv {sample}.rastair_mbias_processed.txt {output[2]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/rastair.yaml"
+
+[[rules]]
+name = "rastair_call"
+input = [
+    "{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam",
+    "{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam.bai",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+    "{config.out_dir}/taps/{sample}.rastair_mbias_processed.csv",
+]
+output = ["{config.out_dir}/taps/{sample}.rastair_call.txt"]
+description = "Call methylation with rastair call (TAPS chain, DRAFT)"
+when = "config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+# Upstream hands trim_OT/trim_OB to the call process as channel env values;
+# the port re-parses them from the mbiasparser CSV (head -n1 / head -n2),
+# falling back to the config keys when the CSV has no values.
+trim_OT=$(head -n 1 {input[4]})
+[ -z "$trim_OT" ] && trim_OT="{config.trim_ot}"
+trim_OB=$(head -n 2 {input[4]} | tail -n 1)
+[ -z "$trim_OB" ] && trim_OB="{config.trim_ob}"
+rastair call \\
+    --threads {threads} \\
+    --nOT $trim_OT \\
+    --nOB $trim_OB \\
+    --fasta-file {config.fasta} \\
+    {input[0]} > {sample}.rastair_call.txt
+mv {sample}.rastair_call.txt {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/rastair.yaml"
+
+[[rules]]
+name = "rastair_methylkit"
+input = ["{config.out_dir}/taps/{sample}.rastair_call.txt"]
+output = ["{config.out_dir}/taps/{sample}.rastair_methylkit.txt.gz"]
+description = "Convert rastair calls to methylKit format (TAPS chain, DRAFT)"
+when = "config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+cat {input[0]} | rastair_call_to_methylkit.sh | gzip -c > {sample}.rastair_methylkit.txt.gz
+mv {sample}.rastair_methylkit.txt.gz {output[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/rastair.yaml"
+
+# ---------------------------------------------------------------------------
+# 11g. Targeted sequencing (upstream: TARGETED_SEQUENCING, runs when
+#      --run_targeted_sequencing; CollectHsMetrics when --collecthsmetrics).
+#      DRAFT rules. The bedGraph source depends on the aligner (bismark
+#      extractor vs MethylDackel) — two intersect rules; the remaining Picard
+#      rules are aligner-independent. Upstream hard-errors on taps/bwamem;
+#      the port's when-gates leave the chain inactive instead.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "bedtools_intersect"
+input = [
+    "{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bedGraph.gz",
+    "{config.target_regions_file}",
+]
+output = ["{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bedGraph.targeted.bedGraph"]
+description = "Intersect the bismark bedGraph with the target regions (targeted sequencing, DRAFT)"
+when = "config.run_targeted_sequencing && (config.aligner == 'bismark' || config.aligner == 'bismark_hisat')"
+shell = """
+bedtools \\
+    intersect \\
+    -a {input[0]} \\
+    -b {input[1]} \\
+    > {sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bedGraph.targeted.bedGraph
+mv {sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.bedGraph.targeted.bedGraph {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/methyldackel.yaml"
+
+[[rules]]
+name = "bedtools_intersect_methyldackel"
+input = [
+    "{config.out_dir}/methyldackel/{sample}.markdup.sorted_CpG.bedGraph",
+    "{config.target_regions_file}",
+]
+output = ["{config.out_dir}/methyldackel/{sample}.markdup.sorted_CpG.targeted.bedGraph"]
+description = "Intersect the MethylDackel bedGraph with the target regions (targeted sequencing, bwameth chain, DRAFT; inactive when methyl_kit or skip_deduplication — the bedGraph is then not produced)"
+when = "config.run_targeted_sequencing && config.aligner == 'bwameth' && !config.taps && !config.methyl_kit && !config.skip_deduplication && !config.rrbs"
+shell = """
+bedtools \\
+    intersect \\
+    -a {input[0]} \\
+    -b {input[1]} \\
+    > {sample}.markdup.sorted_CpG.targeted.bedGraph
+mv {sample}.markdup.sorted_CpG.targeted.bedGraph {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/methyldackel.yaml"
+
+[[rules]]
+name = "picard_createsequencedictionary"
+input = ["{config.fasta}"]
+output = ["{config.fasta}.dict"]
+description = "Create the reference sequence dictionary with Picard (targeted sequencing, DRAFT; the .dict is written next to the reference, like the .fai)"
+when = "config.run_targeted_sequencing && config.collecthsmetrics"
+shell = """
+picard \\
+    -Xmx29491M \\
+    CreateSequenceDictionary \\
+    --REFERENCE {config.fasta} \\
+    --OUTPUT {config.fasta}.dict
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "picard_bedtointervallist"
+input = [
+    "{config.target_regions_file}",
+    "{config.fasta}.dict",
+]
+output = ["{config.out_dir}/enrichment_metrics/target_regions.intervallist"]
+description = "Convert the target BED to an interval list with Picard (targeted sequencing, DRAFT; the port pins the output name to target_regions.intervallist — upstream names it after the BED file)"
+when = "config.run_targeted_sequencing && config.collecthsmetrics"
+shell = """
+picard \\
+    -Xmx9830M \\
+    BedToIntervalList \\
+    --INPUT {input[0]} \\
+    --OUTPUT {output[0]} \\
+    --SEQUENCE_DICTIONARY {input[1]} \\
+    --TMP_DIR .
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "picard_collecthsmetrics_bismark"
+input = [
+    "{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam",
+    "{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam.bai",
+    "{config.out_dir}/enrichment_metrics/target_regions.intervallist",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+    "{config.fasta}.dict",
+]
+output = ["{config.out_dir}/enrichment_metrics/{sample}.CollectHsMetrics.coverage_metrics"]
+description = "Collect hybrid-selection metrics with Picard on the bismark sorted BAM (targeted sequencing, DRAFT; upstream uses the same interval list for baits and targets)"
+when = "config.run_targeted_sequencing && config.collecthsmetrics && (config.aligner == 'bismark' || config.aligner == 'bismark_hisat')"
+shell = """
+picard \\
+    -Xmx4915M \\
+    CollectHsMetrics \\
+    --MINIMUM_MAPPING_QUALITY 20 \\
+    --COVERAGE_CAP 1000 \\
+    --NEAR_DISTANCE 500 \\
+    --REFERENCE_SEQUENCE {input[3]} \\
+    --BAIT_INTERVALS {input[2]} \\
+    --TARGET_INTERVALS {input[2]} \\
+    --INPUT {input[0]} \\
+    --OUTPUT {sample}.CollectHsMetrics.coverage_metrics
+mv {sample}.CollectHsMetrics.coverage_metrics {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "picard_collecthsmetrics_bwameth"
+input = [
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam",
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam.bai",
+    "{config.out_dir}/enrichment_metrics/target_regions.intervallist",
+    "{config.fasta}",
+    "{config.fasta}.fai",
+    "{config.fasta}.dict",
+]
+output = ["{config.out_dir}/enrichment_metrics/{sample}.CollectHsMetrics.coverage_metrics"]
+description = "Collect hybrid-selection metrics with Picard on the bwameth deduplicated BAM (targeted sequencing, DRAFT; upstream uses the same interval list for baits and targets)"
+when = "config.run_targeted_sequencing && config.collecthsmetrics && config.aligner == 'bwameth' && !config.skip_deduplication && !config.rrbs"
+shell = """
+picard \\
+    -Xmx4915M \\
+    CollectHsMetrics \\
+    --MINIMUM_MAPPING_QUALITY 20 \\
+    --COVERAGE_CAP 1000 \\
+    --NEAR_DISTANCE 500 \\
+    --REFERENCE_SEQUENCE {input[3]} \\
+    --BAIT_INTERVALS {input[2]} \\
+    --TARGET_INTERVALS {input[2]} \\
+    --INPUT {input[0]} \\
+    --OUTPUT {sample}.CollectHsMetrics.coverage_metrics
+mv {sample}.CollectHsMetrics.coverage_metrics {output[0]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+# ---------------------------------------------------------------------------
+# 11h. QualiMap BamQC + Preseq LCEXTRAP (upstream: QUALIMAP_BAMQC /
+#      PRESEQ_LCEXTRAP, run when --run_qualimap / --run_preseq). DRAFT rules.
+#      One rule per chain because the per-chain BAM differs. Upstream's
+#      -gd HUMAN/MOUSE (from the --genome param) is not ported; the upstream
+#      --bamqc_regions_file input is config-driven, not a declared input
+#      (so it is not checkpoint-tracked — documented DRAFT deviation).
+#      The bwameth/bwamem variants consume the deduplicated BAM; with
+#      skip_deduplication they stay inactive (documented limitation).
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "qualimap_bamqc_bismark"
+input = [
+    "{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam",
+]
+output = ["{config.out_dir}/bismark/qualimap/bamqc/{sample}/"]
+description = "Run QualiMap bamQC on the bismark sorted BAM (DRAFT)"
+when = "config.run_qualimap && (config.aligner == 'bismark' || config.aligner == 'bismark_hisat')"
+shell = """
+unset DISPLAY
+mkdir -p tmp
+export _JAVA_OPTIONS=-Djava.io.tmpdir=./tmp
+regions=""
+[ -n "{config.bamqc_regions_file}" ] && regions="--gff {config.bamqc_regions_file}"
+qualimap \\
+    --java-mem-size=29491M \\
+    bamqc \\
+    -bam {input[0]} \\
+    $regions \\
+    -p non-strand-specific \\
+    --collect-overlap-pairs \\
+    -outdir {sample} \\
+    -nt {threads}
+mv {sample} {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "qualimap_bamqc_bwameth"
+input = [
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam",
+]
+output = ["{config.out_dir}/bwameth/qualimap/bamqc/{sample}/"]
+description = "Run QualiMap bamQC on the bwameth deduplicated BAM (DRAFT)"
+when = "config.run_qualimap && config.aligner == 'bwameth' && !config.skip_deduplication && !config.rrbs"
+shell = """
+unset DISPLAY
+mkdir -p tmp
+export _JAVA_OPTIONS=-Djava.io.tmpdir=./tmp
+regions=""
+[ -n "{config.bamqc_regions_file}" ] && regions="--gff {config.bamqc_regions_file}"
+qualimap \\
+    --java-mem-size=29491M \\
+    bamqc \\
+    -bam {input[0]} \\
+    $regions \\
+    -p non-strand-specific \\
+    --collect-overlap-pairs \\
+    -outdir {sample} \\
+    -nt {threads}
+mv {sample} {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "qualimap_bamqc_bwamem"
+input = [
+    "{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam",
+]
+output = ["{config.out_dir}/bwamem/qualimap/bamqc/{sample}/"]
+description = "Run QualiMap bamQC on the bwamem deduplicated BAM (DRAFT)"
+when = "config.run_qualimap && config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+unset DISPLAY
+mkdir -p tmp
+export _JAVA_OPTIONS=-Djava.io.tmpdir=./tmp
+regions=""
+[ -n "{config.bamqc_regions_file}" ] && regions="--gff {config.bamqc_regions_file}"
+qualimap \\
+    --java-mem-size=29491M \\
+    bamqc \\
+    -bam {input[0]} \\
+    $regions \\
+    -p non-strand-specific \\
+    --collect-overlap-pairs \\
+    -outdir {sample} \\
+    -nt {threads}
+mv {sample} {output[0]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "preseq_lcextrap_bismark"
+input = [
+    "{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam",
+]
+output = [
+    "{config.out_dir}/bismark/preseq/{sample}.lc_extrap.txt",
+    "{config.out_dir}/bismark/preseq/log/{sample}.lc_extrap.command.log",
+]
+description = "Estimate library complexity with Preseq lc_extrap (bismark chain, DRAFT; upstream copies .command.err to the log — the port redirects stderr straight to it)"
+when = "config.run_preseq && (config.aligner == 'bismark' || config.aligner == 'bismark_hisat')"
+shell = """
+preseq \\
+    lc_extrap \\
+    -verbose \\
+    -bam \\
+    -pe \\
+    -output {sample}.lc_extrap.txt \\
+    {input[0]} \\
+    2> {sample}.lc_extrap.command.log
+mv {sample}.lc_extrap.txt {output[0]}
+mv {sample}.lc_extrap.command.log {output[1]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "preseq_lcextrap_bwameth"
+input = [
+    "{config.out_dir}/bwameth/deduplicated/{sample}.markdup.sorted.bam",
+]
+output = [
+    "{config.out_dir}/bwameth/preseq/{sample}.lc_extrap.txt",
+    "{config.out_dir}/bwameth/preseq/log/{sample}.lc_extrap.command.log",
+]
+description = "Estimate library complexity with Preseq lc_extrap (bwameth chain, DRAFT)"
+when = "config.run_preseq && config.aligner == 'bwameth' && !config.skip_deduplication && !config.rrbs"
+shell = """
+preseq \\
+    lc_extrap \\
+    -verbose \\
+    -bam \\
+    -pe \\
+    -output {sample}.lc_extrap.txt \\
+    {input[0]} \\
+    2> {sample}.lc_extrap.command.log
+mv {sample}.lc_extrap.txt {output[0]}
+mv {sample}.lc_extrap.command.log {output[1]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
+
+[[rules]]
+name = "preseq_lcextrap_bwamem"
+input = [
+    "{config.out_dir}/bwamem/deduplicated/{sample}.markdup.sorted.bam",
+]
+output = [
+    "{config.out_dir}/bwamem/preseq/{sample}.lc_extrap.txt",
+    "{config.out_dir}/bwamem/preseq/log/{sample}.lc_extrap.command.log",
+]
+description = "Estimate library complexity with Preseq lc_extrap (bwamem chain, DRAFT)"
+when = "config.run_preseq && config.aligner == 'bwamem' && !config.skip_deduplication"
+shell = """
+preseq \\
+    lc_extrap \\
+    -verbose \\
+    -bam \\
+    -pe \\
+    -output {sample}.lc_extrap.txt \\
+    {input[0]} \\
+    2> {sample}.lc_extrap.command.log
+mv {sample}.lc_extrap.txt {output[0]}
+mv {sample}.lc_extrap.command.log {output[1]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/picard.yaml"
 
 # ---------------------------------------------------------------------------
 # 12. Software versions (upstream: softwareVersionsToYAML + collectFile ->
@@ -609,6 +1941,54 @@ BISMARK_REPORT:
   bismark: 0.25.1
 BISMARK_SUMMARY:
   bismark: 0.25.1
+BWAMETH_INDEX:
+  bwameth: 0.2.9
+  bwa: 0.7.19
+BWAMETH_ALIGN:
+  bwameth: 0.2.9
+  bwa: 0.7.19
+  samtools: 1.22.1
+BWA_INDEX:
+  bwa: 0.7.19
+BWA_MEM:
+  bwa: 0.7.19
+  samtools: 1.22.1
+SAMTOOLS_STATS:
+  samtools: 1.22.1
+SAMTOOLS_FLAGSTAT:
+  samtools: 1.22.1
+SAMTOOLS_IDXSTATS:
+  samtools: 1.22.1
+SAMTOOLS_FAIDX:
+  samtools: 1.22.1
+PICARD_MARKDUPLICATES:
+  picard: 3.4.0
+PICARD_ADDORREPLACEREADGROUPS:
+  picard: 3.4.0
+PICARD_CREATESEQUENCEDICTIONARY:
+  picard: 3.4.0
+PICARD_BEDTOINTERVALLIST:
+  picard: 3.4.0
+PICARD_COLLECTHSMETRICS:
+  picard: 3.4.0
+METHYLDACKEL_EXTRACT:
+  methyldackel: 0.6.1
+METHYLDACKEL_MBIAS:
+  methyldackel: 0.6.1
+RASTAIR_MBIAS:
+  rastair: 0.8.2
+RASTAIR_MBIASPARSER:
+  rastair: 0.8.2
+RASTAIR_CALL:
+  rastair: 0.8.2
+RASTAIR_METHYLKIT:
+  rastair: 0.8.2
+BEDTOOLS_INTERSECT:
+  bedtools: 2.31.1
+QUALIMAP_BAMQC:
+  qualimap: 2.3
+PRESEQ_LCEXTRAP:
+  preseq: 3.2.0
 MULTIQC:
   multiqc: 1.32
 VERSIONS_EOF
@@ -630,11 +2010,11 @@ expand_inputs = [
     { pattern = "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/trimgalore/logs/{sample}_1.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/trimgalore/logs/{sample}_2.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
-    { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt", variables = { sample = "config.samples_list" } },
-    { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt", variables = { sample = "config.samples_list" } },
-    { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
-    { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
-    { pattern = "{config.out_dir}/bismark/reports/{sample}_1_val_1_bismark_bt2_PE_report.html", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_{config.align_suffix}_PE_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplication_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_{config.align_suffix}_pe.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/reports/{sample}_1_val_1_bismark_{config.align_suffix}_PE_report.html", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/summary/bismark_summary_report.html", variables = {} },
     { pattern = "{config.out_dir}/bismark/summary/bismark_summary_report.txt", variables = {} },
     { pattern = "{config.out_dir}/pipeline_info/nf_core_methylseq_software_mqc_versions.yml", variables = {} },
@@ -643,8 +2023,115 @@ output = [
     "{config.out_dir}/multiqc/bismark/multiqc_report.html",
     "{config.out_dir}/multiqc/bismark/multiqc_data/",
 ]
-description = "Collate all reports with MultiQC"
-when = "!config.skip_multiqc"
+description = "Collate all reports with MultiQC (bismark / bismark_hisat chains)"
+when = "!config.skip_multiqc && (config.aligner == 'bismark' || config.aligner == 'bismark_hisat')"
+optional = true
+shell = """
+rm -rf multiqc_work multiqc_data
+mkdir -p multiqc_work
+# Absolute symlink targets: multiqc only scans the staging directory
+for f in {input}; do
+    ln -sf "$PWD/$f" multiqc_work/
+done
+args=""
+[ -n "{config.multiqc_title}" ] && args="--title \"{config.multiqc_title}\""
+multiqc \\
+    --force \\
+    $args \\
+    --config config/multiqc_config.yml \\
+    multiqc_work/
+rm -rf {output[1]}
+mv multiqc_report.html {output[0]}
+mv multiqc_data {output[1]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/multiqc.yaml"
+
+# ---------------------------------------------------------------------------
+# 13b. MultiQC for the bwameth chain (upstream: FASTQ_ALIGN_DEDUP_BWAMETH's
+#      multiqc channel = picard metrics + flagstat + stats; bamqc/preseq
+#      results are mixed into ch_multiqc_files in main.nf too — the port
+#      keeps the QC rule outputs out of the report (documented deviation).
+#      DRAFT.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "multiqc_bwameth"
+input = []
+expand_inputs = [
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_1_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}_1.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}_2.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bwameth/alignments/samtools_stats/{sample}.sorted.flagstat", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bwameth/alignments/samtools_stats/{sample}.sorted.stats", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bwameth/deduplicated/picard_metrics/{sample}.markdup.sorted.MarkDuplicates.metrics.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/pipeline_info/nf_core_methylseq_software_mqc_versions.yml", variables = {} },
+]
+output = [
+    "{config.out_dir}/multiqc/bwameth/multiqc_report.html",
+    "{config.out_dir}/multiqc/bwameth/multiqc_data/",
+]
+description = "Collate all reports with MultiQC (bwameth chain, DRAFT)"
+when = "!config.skip_multiqc && config.aligner == 'bwameth'"
+optional = true
+shell = """
+rm -rf multiqc_work multiqc_data
+mkdir -p multiqc_work
+# Absolute symlink targets: multiqc only scans the staging directory
+for f in {input}; do
+    ln -sf "$PWD/$f" multiqc_work/
+done
+args=""
+[ -n "{config.multiqc_title}" ] && args="--title \"{config.multiqc_title}\""
+multiqc \\
+    --force \\
+    $args \\
+    --config config/multiqc_config.yml \\
+    multiqc_work/
+rm -rf {output[1]}
+mv multiqc_report.html {output[0]}
+mv multiqc_data {output[1]}
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/multiqc.yaml"
+
+# ---------------------------------------------------------------------------
+# 13c. MultiQC for the bwamem chain (upstream: FASTQ_ALIGN_DEDUP_BWAMEM's
+#      multiqc channel = picard metrics + flagstat + stats + idxstats).
+#      DRAFT.
+# ---------------------------------------------------------------------------
+[[rules]]
+name = "multiqc_bwamem"
+input = []
+expand_inputs = [
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_1_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}_1.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}_2.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.sorted.flagstat", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.sorted.stats", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.sorted.idxstats", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bwamem/deduplicated/picard_metrics/{sample}.markdup.sorted.MarkDuplicates.metrics.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/pipeline_info/nf_core_methylseq_software_mqc_versions.yml", variables = {} },
+]
+output = [
+    "{config.out_dir}/multiqc/bwamem/multiqc_report.html",
+    "{config.out_dir}/multiqc/bwamem/multiqc_data/",
+]
+description = "Collate all reports with MultiQC (bwamem chain, DRAFT)"
+when = "!config.skip_multiqc && config.aligner == 'bwamem'"
 optional = true
 shell = """
 rm -rf multiqc_work multiqc_data
