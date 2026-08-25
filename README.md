@@ -109,6 +109,28 @@ mem2 index variant (`use_mem2`), the optional branches (`taps`,
 (`all_contexts`, `merge_context`, `min_depth`, `ignore_flags`, `methyl_kit`).
 Every optional branch is off by default, matching the upstream defaults.
 
+### Branch-specific test data
+
+The bundled `test/fixtures/raw` reads are WGBS (bisulfite-converted) and only
+map under the bisulfite-aware aligners (bismark / bismark_hisat / bwameth).
+The `bwamem` branch is upstream's TAPS/EM-seq path (`bwa mem` on
+non-converted reads — see the upstream usage docs' "BWA-MEM align (TAPS)"
+diagram), so live-testing it uses the unconverted fixture
+`test/fixtures/raw_emseq` (read pairs cut from the reference genome):
+
+```bash
+oxo-flow run main.oxoflow aligner=bwamem raw_dir=test/fixtures/raw_emseq
+```
+
+Two QC notes for tiny synthetic fixtures (real data is unaffected):
+
+- **MultiQC** (v1.32, the upstream pin) can crash inside its own
+  samtools-stats BarPlot when every sample's stats are degenerate (0/constant
+  values). Run the branch with `skip_multiqc=true` on ultra-small fixtures.
+- **preseq lc_extrap** requires duplicate counts ≥ 4 in the BAM
+  ("max count before zero is less than min required count"); the emseq
+  fixture ships each read 10× so the bwamem + preseq combination works.
+
 ## Source
 
 Ported from **[nf-core/methylseq](https://github.com/nf-core/methylseq)**,
@@ -174,8 +196,9 @@ Each deviation is cosmetic or a mechanism swap — the effective commands and
 outputs match upstream:
 
 1. **bismark_hisat output names** — hisat2-mode alignments are renamed from
-   the upstream `_bismark_hisat_` infix to the canonical `_bismark_bt2_`
-   names so the shared downstream chain works unchanged (cosmetic).
+   the upstream `_bismark_hisat2_` infix (bismark 0.24.x names, live-verified)
+   to the canonical `_bismark_bt2_` names so the shared downstream chain works
+   unchanged (cosmetic).
 2. **`--known-splicesite-infile`** — upstream passes
    `<(...)` (process substitution); the port materializes the same
    `hisat2_extract_splice_sites.py` output to a temp file (bash process

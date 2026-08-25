@@ -535,12 +535,13 @@ bismark \\
     --genome {input[2]} \\
     --bam \\
     $args
-# bismark_hisat names its outputs with a _bismark_hisat_ infix; the port
+# bismark_hisat names its outputs with a _bismark_hisat2_ infix (live-verified
+# on bismark 0.24.x: S1_1_val_1_bismark_hisat2_pe.bam); the port
 # renames them to the canonical bt2-style names so the shared downstream
 # chain works unchanged (cosmetic deviation).
 if [ "{config.aligner}" = "bismark_hisat" ]; then
-    mv {sample}_1_val_1_bismark_hisat_pe.bam {output[0]}
-    mv {sample}_1_val_1_bismark_hisat_PE_report.txt {output[1]}
+    mv {sample}_1_val_1_bismark_hisat2_pe.bam {output[0]}
+    mv {sample}_1_val_1_bismark_hisat2_PE_report.txt {output[1]}
 else
     mv {sample}_1_val_1_bismark_bt2_pe.bam {output[0]}
     mv {sample}_1_val_1_bismark_bt2_PE_report.txt {output[1]}
