@@ -1244,6 +1244,10 @@ rastair mbias \\
     --threads {threads} \\
     --fasta-file refs/FastaRef/reference.fa \\
     {input[0]} > {sample}.rastair_mbias.txt
+# Fail fast instead of propagating an empty file (rastair exits 0 with no
+# stdout when the BAM index yields no intervals — live-verified on a BAM
+# with only unplaced reads).
+[ -s {sample}.rastair_mbias.txt ] || { echo "rastair mbias produced no output"; exit 1; }
 mv {sample}.rastair_mbias.txt {output[0]}
 """
 
@@ -1273,6 +1277,10 @@ rastair mbias \\
     --threads {threads} \\
     --fasta-file refs/FastaRef/reference.fa \\
     {input[0]} > {sample}.rastair_mbias.txt
+# Fail fast instead of propagating an empty file (rastair exits 0 with no
+# stdout when the BAM index yields no intervals — live-verified on a BAM
+# with only unplaced reads).
+[ -s {sample}.rastair_mbias.txt ] || { echo "rastair mbias produced no output"; exit 1; }
 mv {sample}.rastair_mbias.txt {output[0]}
 """
 
@@ -1297,6 +1305,8 @@ description = "Parse the rastair mbias output to trim values with plot_mbias.R /
 when = "(config.taps && config.aligner == \"bwameth\") || config.aligner == \"bwamem\""
 shell = """
 plot_mbias.R --pdf -o {sample}.rastair_mbias_processed.pdf {input[0]} > {sample}.rastair_mbias_processed.txt
+# Fail fast on an empty rastair mbias input (plot_mbias.R writes nothing).
+[ -s {sample}.rastair_mbias_processed.txt ] || { echo "plot_mbias.R produced no output"; exit 1; }
 parse_mbias.R {sample}.rastair_mbias_processed.txt {sample}.rastair_mbias_processed.csv
 mv {sample}.rastair_mbias_processed.pdf {output[0]}
 mv {sample}.rastair_mbias_processed.csv {output[1]}
