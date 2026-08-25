@@ -498,8 +498,12 @@ description = "Align trimmed reads with Bismark (bowtie2 by default, hisat2 for 
 when = "config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\""
 depends_on = ["bismark_genomepreparation", "bismark_untar"]
 shell = """
-args="--bowtie2"
-[ "{config.aligner}" = "bismark_hisat" ] && args="$args --hisat2"
+args=""
+if [ "{config.aligner}" = "bismark_hisat" ]; then
+    args="--hisat2"
+else
+    args="--bowtie2"
+fi
 if [ "{config.aligner}" = "bismark_hisat" ] && [ -n "{config.known_splices}" ]; then
     # Upstream: --known-splicesite-infile <(hisat2_extract_splice_sites.py ...)
     # (process substitution); the port materializes the same list to a file.
