@@ -1,0 +1,9 @@
+# Environment for QualiMap BamQC — pinned exactly to the upstream
+# nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/qualimap/bamqc/environment.yml).
+name: qualimap
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::qualimap=2.3

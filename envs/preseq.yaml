@@ -1,0 +1,9 @@
+# Environment for preseq lc_extrap — pinned exactly to the upstream
+# nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/preseq/lcextrap/environment.yml).
+name: preseq
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::preseq=3.2.0

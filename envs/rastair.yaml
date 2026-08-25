@@ -1,0 +1,15 @@
+# Environment for all rastair rules (mbias, mbiasparser, call, methylkit).
+# Upstream splits this across four envs: mbias/call pin bioconda::rastair
+# 0.8.2, while mbiasparser/methylkit pin the `=*_2` build and mbiasparser
+# additionally pins conda-forge::r-base 4.4.0 (the R helper scripts
+# plot_mbias.R / parse_mbias.R / rastair_call_to_methylkit.sh ship in that
+# build). The port consolidates to the `=*_2` build + r-base for every
+# rastair rule so the helper scripts are always present (documented
+# deviation).
+name: rastair
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::rastair=0.8.2=*_2
+  - conda-forge::r-base=4.4.0

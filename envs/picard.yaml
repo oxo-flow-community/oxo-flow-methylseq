@@ -1,0 +1,10 @@
+# Environment for the Picard rules (markduplicates, addorreplacereadgroups,
+# createsequencedictionary, bedtointervallist, collecthsmetrics) — pinned
+# exactly to the upstream nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/picard/*/environment.yml, all pin picard=3.4.0).
+name: picard
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::picard=3.4.0
