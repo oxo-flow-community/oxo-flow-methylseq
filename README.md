@@ -130,6 +130,14 @@ Two QC notes for tiny synthetic fixtures (real data is unaffected):
 - **preseq lc_extrap** requires duplicate counts ≥ 4 in the BAM
   ("max count before zero is less than min required count"); the emseq
   fixture ships each read 10× so the bwamem + preseq combination works.
+- **rastair mbias on the bwamem branch** — live-verified on the synthetic
+  fixture: `rastair mbias` prints header-only rows for the partially
+  C→T-converted fixture reads (bwa mem cannot map fully-converted reads, and
+  the sparse conversion signal of the fixture yields no per-position counts),
+  while the same rule produces full tables on the bwameth branch (WGBS
+  fixture). The rules fail fast (`[ -s … ]` guards) instead of silently
+  propagating empty files. Real TAPS/EM-seq data has the full conversion
+  signal rastair counts; this is a fixture limitation, not a workflow bug.
 
 ## Source
 
