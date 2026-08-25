@@ -1,0 +1,10 @@
+# Environment for the MethylDackel rules (extract + mbias) — pinned exactly
+# to the upstream nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/methyldackel/extract/environment.yml and
+# modules/nf-core/methyldackel/mbias/environment.yml).
+name: methyldackel
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::methyldackel=0.6.1

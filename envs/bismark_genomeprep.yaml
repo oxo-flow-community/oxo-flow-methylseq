@@ -1,0 +1,15 @@
+# Environment for bismark_genome_preparation. Bismark is pinned exactly to
+# the upstream nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/bismark/genomepreparation/environment.yml,
+# bioconda::bismark=0.25.1). gzip=1.13 is added (the upstream GUNZIP module
+# runs in a separate coreutils env; the port merges the decompression dep
+# here) because the bioconda bismark 0.25.1 build — the Rust rewrite that
+# bundles bowtie2 + hisat2 + minimap2 — does not depend on gzip, and the
+# port's genomeprep shell decompresses a gzipped reference FASTA in-place.
+name: bismark_genomeprep
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::bismark=0.25.1
+  - conda-forge::gzip=1.13

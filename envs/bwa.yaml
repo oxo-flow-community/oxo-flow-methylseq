@@ -1,0 +1,13 @@
+# Environment for BWA index building and BWA-MEM alignment — pinned exactly
+# to the upstream nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/bwa/index/environment.yml and
+# modules/nf-core/bwa/mem/environment.yml). The samtools/htslib pins cover
+# the in-pipeline `samtools sort` of the BWA-MEM output.
+name: bwa
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::bwa=0.7.19
+  - bioconda::htslib=1.22.1
+  - bioconda::samtools=1.22.1

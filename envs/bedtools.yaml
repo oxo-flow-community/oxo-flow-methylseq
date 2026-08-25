@@ -1,0 +1,9 @@
+# Environment for the bedtools intersect rules — pinned exactly to the
+# upstream nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/bedtools/intersect/environment.yml).
+name: bedtools
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::bedtools=2.31.1

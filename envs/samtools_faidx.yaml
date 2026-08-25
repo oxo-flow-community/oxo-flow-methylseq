@@ -1,0 +1,14 @@
+# Environment for samtools faidx. The samtools/htslib pins are exactly the
+# upstream nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/samtools/faidx/environment.yml). gzip=1.13 is added (the
+# upstream GUNZIP module runs in a separate coreutils env; the port merges
+# the decompression dep here) because the port's faidx shell decompresses a
+# gzipped reference FASTA in-place.
+name: samtools_faidx
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::htslib=1.22.1
+  - bioconda::samtools=1.22.1
+  - conda-forge::gzip=1.13

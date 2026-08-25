@@ -1,0 +1,10 @@
+# Environment for bwameth index building and alignment — pinned exactly to
+# the upstream nf-core/methylseq 4.2.0 module environment
+# (modules/nf-core/bwameth/index/environment.yml and
+# modules/nf-core/bwameth/align/environment.yml).
+name: bwameth
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::bwameth=0.2.9
