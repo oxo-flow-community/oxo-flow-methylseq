@@ -841,7 +841,7 @@ conda = "envs/bismark.yaml"
 
 # 6b. Picard MarkDuplicates on the bwameth sorted alignment (upstream:
 #     PICARD_MARKDUPLICATES, label process_medium; prefix
-#     <sample>.markdup.sorted). -Xmx = memory*0.8 (36G -> 29491M).
+#     <sample>.markdup.sorted). -Xmx = effective_memory_mb*0.8, computed at runtime.
 [[rules]]
 name = "picard_markduplicates"
 input = [
@@ -857,8 +857,9 @@ when = "config.aligner == \"bwameth\" && !config.skip_deduplication && !config.r
 depends_on = ["samtools_faidx"]
 shell = """
 mkdir -p tmp
+XMX=$(({effective_memory_mb} * 8 / 10))
 picard \\
-    -Xmx29491M \\
+    -Xmx${XMX}M \\
     MarkDuplicates \\
     --ASSUME_SORTED true --REMOVE_DUPLICATES false --VALIDATION_STRINGENCY LENIENT --TMP_DIR tmp \\
     --PROGRAM_RECORD_ID null \\
@@ -916,8 +917,9 @@ description = "Add read groups to the bwamem alignments with Picard AddOrReplace
 when = "config.aligner == \"bwamem\" && !config.skip_deduplication"
 depends_on = ["samtools_faidx"]
 shell = """
+XMX=$(({effective_memory_mb} * 8 / 10))
 picard \\
-    -Xmx9830M \\
+    -Xmx${XMX}M \\
     AddOrReplaceReadGroups \\
     --RGID 1 --RGLB lib1 --RGPL illumina --RGPU unit1 --RGSM sample1 \\
     --REFERENCE_SEQUENCE refs/FastaRef/reference.fa \\
@@ -952,8 +954,9 @@ when = "config.aligner == \"bwamem\" && !config.skip_deduplication"
 depends_on = ["samtools_faidx"]
 shell = """
 mkdir -p tmp
+XMX=$(({effective_memory_mb} * 8 / 10))
 picard \\
-    -Xmx29491M \\
+    -Xmx${XMX}M \\
     MarkDuplicates \\
     --ASSUME_SORTED true --REMOVE_DUPLICATES false --VALIDATION_STRINGENCY LENIENT --TMP_DIR tmp \\
     --PROGRAM_RECORD_ID null \\
@@ -1663,8 +1666,9 @@ when = "config.run_targeted_sequencing && config.collecthsmetrics"
 depends_on = ["samtools_faidx"]
 shell = """
 mkdir -p refs/RefDict
+XMX=$(({effective_memory_mb} * 8 / 10))
 picard \\
-    -Xmx29491M \\
+    -Xmx${XMX}M \\
     CreateSequenceDictionary \\
     --REFERENCE refs/FastaRef/reference.fa \\
     --OUTPUT refs/RefDict/reference.dict
@@ -1691,8 +1695,9 @@ description = "Convert the target regions BED to an interval list with Picard Be
 when = "config.run_targeted_sequencing && config.collecthsmetrics"
 shell = """
 mkdir -p {config.out_dir}/enrichment_metrics
+XMX=$(({effective_memory_mb} * 8 / 10))
 picard \\
-    -Xmx9830M \\
+    -Xmx${XMX}M \\
     BedToIntervalList \\
     --INPUT {config.target_regions_file} \\
     --OUTPUT target_regions.intervallist \\
@@ -1840,8 +1845,9 @@ when = "config.run_targeted_sequencing && config.collecthsmetrics && !config.tap
 depends_on = ["samtools_faidx"]
 shell = """
 mkdir -p {config.out_dir}/enrichment_metrics
+XMX=$(({effective_memory_mb} * 8 / 10))
 picard \\
-    -Xmx4915M \\
+    -Xmx${XMX}M \\
     CollectHsMetrics \\
     --MINIMUM_MAPPING_QUALITY 20 --COVERAGE_CAP 1000 --NEAR_DISTANCE 500 \\
     --REFERENCE_SEQUENCE refs/FastaRef/reference.fa \\
@@ -1876,8 +1882,9 @@ when = "config.run_targeted_sequencing && config.collecthsmetrics && !config.tap
 depends_on = ["samtools_faidx"]
 shell = """
 mkdir -p {config.out_dir}/enrichment_metrics
+XMX=$(({effective_memory_mb} * 8 / 10))
 picard \\
-    -Xmx4915M \\
+    -Xmx${XMX}M \\
     CollectHsMetrics \\
     --MINIMUM_MAPPING_QUALITY 20 --COVERAGE_CAP 1000 --NEAR_DISTANCE 500 \\
     --REFERENCE_SEQUENCE refs/FastaRef/reference.fa \\
