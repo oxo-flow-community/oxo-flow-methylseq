@@ -21,7 +21,9 @@ all-context (CHG/CHH) calls.
 
 ### 1. Install oxo-flow
 
-Requires **oxo-flow >= 0.12.0**. Recommended: the prebuilt release binary for
+Requires **oxo-flow >= 0.14.0** (the picard rules size `-Xmx` from the
+`{effective_memory_mb}` placeholder, added in 0.14.0). Recommended: the
+prebuilt release binary for
 Linux x86_64:
 
 ```bash
