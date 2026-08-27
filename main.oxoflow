@@ -13,6 +13,9 @@
 #   by the same [config] keys the upstream `params.*` expose).
 # - Upstream process labels (cpus/memory/time) are baked into [rules.resources].
 # - Paired-end only (upstream `single_end` samplesheet column is not ported).
+# - CAT_FASTQ is ported (section 2) via the engine's input_groups primitive:
+#   samples with >1 fastq pair (unit-named raw files) are concatenated into
+#   one pair before QC/trimming; single-pair samples pass through unchanged.
 # - All four aligners are ported: bismark (bowtie2, default), bismark_hisat,
 #   bwameth and bwamem, plus the TAPS (rastair), methyldackel, qualimap,
 #   preseq, targeted-sequencing (bedtools + picard) and prebuilt-index
@@ -87,6 +90,11 @@ skip_fastqc = false
 skip_trimming = false
 skip_deduplication = false
 skip_multiqc = false
+# Concatenate multi-pair fastqs (upstream: CAT_FASTQ — always active for
+# samples with >1 fastq pair; upstream has no param for it). Set to false
+# only when every sample has a single pair: multi-pair samples would then
+# lack the merged reads the downstream rules consume.
+cat_fastq = true
 # Library presets (upstream params with the same defaults).
 rrbs = false
 pbat = false
@@ -333,11 +341,85 @@ time_limit = "4h"
 conda = "envs/samtools_faidx.yaml"
 
 # ---------------------------------------------------------------------------
-# 2. FastQC on raw reads (upstream: FASTQC, label process_medium)
+# 2. Concatenate multi-pair fastqs (upstream: CAT_FASTQ, label process_single)
+# ---------------------------------------------------------------------------
+# Upstream concatenates the R1s and R2s of every sample with >1 fastq pair
+# (ch_samplesheet.multiple) into one pair before QC/trimming; single-pair
+# samples (ch_samplesheet.single) flow through untouched. The port expresses
+# the same split as two rules driven by the engine's input_groups primitive
+# (the Nextflow groupTuple pattern): one instance per sample, {input} = the
+# sample's {unit} files for one read (sorted). A sample with a single unit
+# named with a unit segment is copied through (cat of one file = pass-through).
+# Samples named without a unit segment (the single-pair convention
+# raw/<sample>_R{1,2}.fastq.gz) match no pattern and get no instance — the
+# fastqc/trimgalore rules below fall back to the raw files for them.
+# Each rule requires oxo-flow >= 0.17.0; on older engines input_groups is a
+# no-op and {input} renders empty, so the shell fails loudly instead of
+# writing an empty fastq that would silently corrupt the downstream analysis.
+[[rules]]
+name = "cat_fastq_r1"
+description = "Concatenate the R1 fastqs of a sample's multiple pairs into one (upstream CAT_FASTQ)"
+when = "config.cat_fastq"
+input_groups = [
+    { pattern = "{config.raw_dir}/{sample}_{unit}_R1.fastq.gz", group_by = "sample" },
+]
+output = ["{config.out_dir}/fastq/{sample}_R1.fastq.gz"]
+shell = """
+if [ -z "{input}" ]; then
+    echo "error: cat_fastq needs oxo-flow >= 0.17.0 (input_groups support)" >&2
+    exit 1
+fi
+mkdir -p {config.out_dir}/fastq
+cat {input} > {config.out_dir}/fastq/{sample}_R1.fastq.gz
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/coreutils.yaml"
+
+[[rules]]
+name = "cat_fastq_r2"
+description = "Concatenate the R2 fastqs of a sample's multiple pairs into one (upstream CAT_FASTQ)"
+when = "config.cat_fastq"
+input_groups = [
+    { pattern = "{config.raw_dir}/{sample}_{unit}_R2.fastq.gz", group_by = "sample" },
+]
+output = ["{config.out_dir}/fastq/{sample}_R2.fastq.gz"]
+shell = """
+if [ -z "{input}" ]; then
+    echo "error: cat_fastq needs oxo-flow >= 0.17.0 (input_groups support)" >&2
+    exit 1
+fi
+mkdir -p {config.out_dir}/fastq
+cat {input} > {config.out_dir}/fastq/{sample}_R2.fastq.gz
+"""
+
+[rules.resources]
+threads = 1
+memory = "6G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/coreutils.yaml"
+
+# ---------------------------------------------------------------------------
+# 3. FastQC on raw reads (upstream: FASTQC, label process_medium)
 # ---------------------------------------------------------------------------
 [[rules]]
 name = "fastqc"
-input = ["{config.raw_dir}/{sample}_R1.fastq.gz", "{config.raw_dir}/{sample}_R2.fastq.gz"]
+input = [
+    # Concatenated reads — exist only for multi-pair samples (see cat_fastq)
+    "{config.out_dir}/fastq/{sample}_R1.fastq.gz",
+    "{config.out_dir}/fastq/{sample}_R2.fastq.gz",
+    # Raw reads — the single-pair pass-through (upstream ch_samplesheet.single)
+    "{config.raw_dir}/{sample}_R1.fastq.gz",
+    "{config.raw_dir}/{sample}_R2.fastq.gz",
+]
+optional = "any"
 output = [
     "{config.out_dir}/fastqc/{sample}_1_fastqc.html",
     "{config.out_dir}/fastqc/{sample}_2_fastqc.html",
@@ -347,9 +429,16 @@ output = [
 description = "Run FastQC on the raw reads"
 when = "!config.skip_fastqc"
 shell = """
+# Upstream ch_fastq mixes the CAT_FASTQ outputs with the single-pair reads:
+# use the concatenated pair when it exists (multi-pair sample), else the raw
+# pair (the port's pass-through for single-pair samples).
+r1="{input[0]}"; r2="{input[1]}"
+if [ ! -f "$r1" ] || [ ! -f "$r2" ]; then
+    r1="{input[2]}"; r2="{input[3]}"
+fi
 # Upstream renames reads to <prefix>_1/2.fastq.gz before QC (consistent MultiQC naming)
-ln -sf {input[0]} {sample}_1.fastq.gz
-ln -sf {input[1]} {sample}_2.fastq.gz
+ln -sf "$r1" {sample}_1.fastq.gz
+ln -sf "$r2" {sample}_2.fastq.gz
 # --memory = task.memory (36G) / task.cpus (6) in MB, clamped to 100-10000
 fastqc \\
     --quiet \\
@@ -372,11 +461,19 @@ time_limit = "8h"
 conda = "envs/fastqc.yaml"
 
 # ---------------------------------------------------------------------------
-# 3. TrimGalore (upstream: TRIMGALORE, label process_high)
+# 4. TrimGalore (upstream: TRIMGALORE, label process_high)
 # ---------------------------------------------------------------------------
 [[rules]]
 name = "trimgalore"
-input = ["{config.raw_dir}/{sample}_R1.fastq.gz", "{config.raw_dir}/{sample}_R2.fastq.gz"]
+input = [
+    # Concatenated reads — exist only for multi-pair samples (see cat_fastq)
+    "{config.out_dir}/fastq/{sample}_R1.fastq.gz",
+    "{config.out_dir}/fastq/{sample}_R2.fastq.gz",
+    # Raw reads — the single-pair pass-through (upstream ch_samplesheet.single)
+    "{config.raw_dir}/{sample}_R1.fastq.gz",
+    "{config.raw_dir}/{sample}_R2.fastq.gz",
+]
+optional = "any"
 output = [
     "{config.out_dir}/trimgalore/{sample}_1_val_1.fq.gz",
     "{config.out_dir}/trimgalore/{sample}_2_val_2.fq.gz",
@@ -448,9 +545,16 @@ fi
 cores=$(({threads} - 4))
 [ $cores -lt 1 ] && cores=1
 [ $cores -gt 8 ] && cores=8
+# Upstream ch_fastq mixes the CAT_FASTQ outputs with the single-pair reads:
+# use the concatenated pair when it exists (multi-pair sample), else the raw
+# pair (the port's pass-through for single-pair samples).
+r1="{input[0]}"; r2="{input[1]}"
+if [ ! -f "$r1" ] || [ ! -f "$r2" ]; then
+    r1="{input[2]}"; r2="{input[3]}"
+fi
 # Soft-links to original fastqs for consistent naming in MultiQC
-ln -sf {input[0]} {sample}_1.fastq.gz
-ln -sf {input[1]} {sample}_2.fastq.gz
+ln -sf "$r1" {sample}_1.fastq.gz
+ln -sf "$r2" {sample}_2.fastq.gz
 trim_galore \\
     $args \\
     --cores $cores \\
@@ -477,9 +581,9 @@ time_limit = "16h"
 conda = "envs/trimgalore.yaml"
 
 # ---------------------------------------------------------------------------
-# 4. Alignment (upstream: BISMARK_ALIGN / BWAMETH_ALIGN / BWA_MEM)
+# 5. Alignment (upstream: BISMARK_ALIGN / BWAMETH_ALIGN / BWA_MEM)
 # ---------------------------------------------------------------------------
-# 4a. Bismark alignment (upstream: BISMARK_ALIGN, label process_high,
+# 5a. Bismark alignment (upstream: BISMARK_ALIGN, label process_high,
 #     time override 8d). --bowtie2 by default, --hisat2 for bismark_hisat
 #     (with --known-splicesite-infile when known_splices is set, materialized
 #     to a temp file instead of a process substitution).
@@ -556,7 +660,7 @@ time_limit = "192h"
 [rules.environment]
 conda = "envs/bismark.yaml"
 
-# 4b. bwameth alignment (upstream: BWAMETH_ALIGN, label process_high,
+# 5b. bwameth alignment (upstream: BWAMETH_ALIGN, label process_high,
 #     time override 6d; active on the bwameth branch).
 [[rules]]
 name = "bwameth_align"
@@ -594,7 +698,7 @@ time_limit = "144h"
 [rules.environment]
 conda = "envs/bwameth.yaml"
 
-# 4c. BWA-MEM alignment + sort (upstream: BWA_MEM with sort_bam=true, label
+# 5c. BWA-MEM alignment + sort (upstream: BWA_MEM with sort_bam=true, label
 #     process_high; active on the bwamem branch). Upstream finds the index
 #     prefix by globbing *.amb; the port does the same inside refs/BwaMemIndex.
 [[rules]]
@@ -628,11 +732,11 @@ time_limit = "16h"
 conda = "envs/bwa.yaml"
 
 # ---------------------------------------------------------------------------
-# 5. Sort / index / stat the alignment BAMs (upstream: SAMTOOLS_SORT,
+# 6. Sort / index / stat the alignment BAMs (upstream: SAMTOOLS_SORT,
 #    SAMTOOLS_INDEX_ALIGNMENTS, SAMTOOLS_FLAGSTAT, SAMTOOLS_STATS,
 #    SAMTOOLS_IDXSTATS)
 # ---------------------------------------------------------------------------
-# 5a. samtools sort of the deduplicated bismark BAM (upstream: SAMTOOLS_SORT,
+# 6a. samtools sort of the deduplicated bismark BAM (upstream: SAMTOOLS_SORT,
 #     label process_medium; prefix = <sample>.deduplicated.sorted)
 [[rules]]
 name = "samtools_sort"
@@ -660,7 +764,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/samtools.yaml"
 
-# 5b. samtools sort of the bwameth/bwamem alignment BAM (upstream:
+# 6b. samtools sort of the bwameth/bwamem alignment BAM (upstream:
 #     SAMTOOLS_SORT with prefix <sample>.sorted, label process_medium)
 [[rules]]
 name = "samtools_sort_alignment"
@@ -688,7 +792,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/samtools.yaml"
 
-# 5c. samtools index of the deduplicated bismark BAM (upstream: SAMTOOLS_INDEX,
+# 6c. samtools index of the deduplicated bismark BAM (upstream: SAMTOOLS_INDEX,
 #     label process_low)
 [[rules]]
 name = "samtools_index"
@@ -713,7 +817,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/samtools.yaml"
 
-# 5d. samtools index of the bwameth/bwamem sorted alignment BAM (upstream:
+# 6d. samtools index of the bwameth/bwamem sorted alignment BAM (upstream:
 #     SAMTOOLS_INDEX_ALIGNMENTS, label process_low)
 [[rules]]
 name = "samtools_index_alignment"
@@ -736,7 +840,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/samtools.yaml"
 
-# 5e. samtools flagstat of the sorted alignment BAM (upstream:
+# 6e. samtools flagstat of the sorted alignment BAM (upstream:
 #     SAMTOOLS_FLAGSTAT, label process_single)
 [[rules]]
 name = "samtools_flagstat"
@@ -761,7 +865,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/samtools.yaml"
 
-# 5f. samtools stats of the sorted alignment BAM (upstream: SAMTOOLS_STATS,
+# 6f. samtools stats of the sorted alignment BAM (upstream: SAMTOOLS_STATS,
 #     label process_single)
 [[rules]]
 name = "samtools_stats"
@@ -786,7 +890,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/samtools.yaml"
 
-# 5g. samtools idxstats of the sorted alignment BAM (upstream:
+# 6g. samtools idxstats of the sorted alignment BAM (upstream:
 #     SAMTOOLS_IDXSTATS, label process_single; bwamem branch only)
 [[rules]]
 name = "samtools_idxstats"
@@ -813,10 +917,10 @@ time_limit = "4h"
 conda = "envs/samtools.yaml"
 
 # ---------------------------------------------------------------------------
-# 6. Deduplication (upstream: BISMARK_DEDUPLICATE / PICARD_MARKDUPLICATES /
+# 7. Deduplication (upstream: BISMARK_DEDUPLICATE / PICARD_MARKDUPLICATES /
 #    PICARD_ADDORREPLACEREADGROUPS)
 # ---------------------------------------------------------------------------
-# 6a. Deduplicate bismark alignments (upstream: BISMARK_DEDUPLICATE, label
+# 7a. Deduplicate bismark alignments (upstream: BISMARK_DEDUPLICATE, label
 #     process_high, time override 2d). Skipped when --skip_deduplication or
 #     --rrbs, exactly like upstream.
 [[rules]]
@@ -844,7 +948,7 @@ time_limit = "48h"
 [rules.environment]
 conda = "envs/bismark.yaml"
 
-# 6b. Picard MarkDuplicates on the bwameth sorted alignment (upstream:
+# 7b. Picard MarkDuplicates on the bwameth sorted alignment (upstream:
 #     PICARD_MARKDUPLICATES, label process_medium; prefix
 #     <sample>.markdup.sorted). -Xmx = effective_memory_mb*0.8, computed at runtime.
 [[rules]]
@@ -884,7 +988,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/picard.yaml"
 
-# 6c. samtools index of the bwameth deduplicated BAM (upstream:
+# 7c. samtools index of the bwameth deduplicated BAM (upstream:
 #     SAMTOOLS_INDEX_DEDUPLICATED, label process_low)
 [[rules]]
 name = "samtools_index_deduplicated"
@@ -907,7 +1011,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/samtools.yaml"
 
-# 6d. Picard AddOrReplaceReadGroups on the bwamem sorted alignment (upstream:
+# 7d. Picard AddOrReplaceReadGroups on the bwamem sorted alignment (upstream:
 #     PICARD_ADDORREPLACEREADGROUPS, label process_low; not published
 #     upstream — the port declares it so the DAG can consume it). -Xmx =
 #     memory*0.8 (12G -> 9830M).
@@ -941,7 +1045,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/picard.yaml"
 
-# 6e. Picard MarkDuplicates on the bwamem read-grouped BAM (upstream:
+# 7e. Picard MarkDuplicates on the bwamem read-grouped BAM (upstream:
 #     PICARD_MARKDUPLICATES, label process_medium; prefix
 #     <sample>.markdup.sorted)
 [[rules]]
@@ -981,7 +1085,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/picard.yaml"
 
-# 6f. samtools index of the bwamem deduplicated BAM (upstream: SAMTOOLS_INDEX,
+# 7f. samtools index of the bwamem deduplicated BAM (upstream: SAMTOOLS_INDEX,
 #     label process_low)
 [[rules]]
 name = "samtools_index_deduplicated_bwamem"
@@ -1005,10 +1109,10 @@ time_limit = "4h"
 conda = "envs/samtools.yaml"
 
 # ---------------------------------------------------------------------------
-# 7. Methylation calls (upstream: BISMARK_METHYLATIONEXTRACTOR /
+# 8. Methylation calls (upstream: BISMARK_METHYLATIONEXTRACTOR /
 #    BAM_METHYLDACKEL)
 # ---------------------------------------------------------------------------
-# 7a. Bismark methylation extraction (upstream: BISMARK_METHYLATIONEXTRACTOR,
+# 8a. Bismark methylation extraction (upstream: BISMARK_METHYLATIONEXTRACTOR,
 #     label process_high, time override 1d; input = the deduplicated BAM,
 #     like upstream)
 [[rules]]
@@ -1069,7 +1173,7 @@ time_limit = "24h"
 [rules.environment]
 conda = "envs/bismark.yaml"
 
-# 7b. MethylDackel extract on the bwameth BAM, CpG contexts (upstream:
+# 8b. MethylDackel extract on the bwameth BAM, CpG contexts (upstream:
 #     METHYLDACKEL_EXTRACT, label process_medium; active on the bwameth
 #     branch when TAPS is off). The methylKit and all-contexts variants are
 #     separate gated rules (7c/7d) because oxo-flow validates every declared
@@ -1106,7 +1210,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/methyldackel.yaml"
 
-# 7c. MethylDackel extract with --CHG --CHH (upstream ext.args with
+# 8c. MethylDackel extract with --CHG --CHH (upstream ext.args with
 #     all_contexts; mutually exclusive with 7b)
 [[rules]]
 name = "methyldackel_extract_allcontexts"
@@ -1146,7 +1250,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/methyldackel.yaml"
 
-# 7d. MethylDackel extract with --methylKit (upstream ext.args with
+# 8d. MethylDackel extract with --methylKit (upstream ext.args with
 #     methyl_kit). Runs in addition to 7b/7c — the tool produces only
 #     *.methylKit files when the flag is given, so the bedGraph comes from
 #     the flag-free run.
@@ -1183,7 +1287,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/methyldackel.yaml"
 
-# 7e. MethylDackel mbias (upstream: METHYLDACKEL_MBIAS, label process_low)
+# 8e. MethylDackel mbias (upstream: METHYLDACKEL_MBIAS, label process_low)
 [[rules]]
 name = "methyldackel_mbias"
 input = [
@@ -1219,13 +1323,13 @@ time_limit = "4h"
 conda = "envs/methyldackel.yaml"
 
 # ---------------------------------------------------------------------------
-# 8. TAPS conversion (upstream: BAM_TAPS_CONVERSION — rastair). Active on
+# 9. TAPS conversion (upstream: BAM_TAPS_CONVERSION — rastair). Active on
 #    the bwameth branch with taps, and always on the bwamem branch (upstream
 #    `if (params.taps || params.aligner == 'bwamem')`). Upstream builds no
 #    fasta index for taps on the bismark aligners, so rastair silently
 #    produces nothing there — replicated by not defining bismark variants.
 # ---------------------------------------------------------------------------
-# 8a. rastair mbias (upstream: RASTAIR_MBIAS, label process_medium; bwameth
+# 9a. rastair mbias (upstream: RASTAIR_MBIAS, label process_medium; bwameth
 #     branch with taps)
 [[rules]]
 name = "rastair_mbias_bwameth"
@@ -1259,7 +1363,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/rastair.yaml"
 
-# 8b. rastair mbias, bwamem branch
+# 9b. rastair mbias, bwamem branch
 [[rules]]
 name = "rastair_mbias_bwamem"
 input = [
@@ -1292,7 +1396,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/rastair.yaml"
 
-# 8c. rastair mbias parser (upstream: RASTAIR_MBIASPARSER, label process_low;
+# 9c. rastair mbias parser (upstream: RASTAIR_MBIASPARSER, label process_low;
 #     derives the per-strand trim values that rastair call consumes)
 [[rules]]
 name = "rastair_mbiasparser"
@@ -1320,7 +1424,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/rastair.yaml"
 
-# 8d. rastair call (upstream: RASTAIR_CALL, label process_medium; bwameth
+# 9d. rastair call (upstream: RASTAIR_CALL, label process_medium; bwameth
 #     branch with taps). The trim values flow from the mbiasparser CSV
 #     (upstream passes them through channels; the port re-reads the CSV).
 [[rules]]
@@ -1354,7 +1458,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/rastair.yaml"
 
-# 8e. rastair call, bwamem branch
+# 9e. rastair call, bwamem branch
 [[rules]]
 name = "rastair_call_bwamem"
 input = [
@@ -1386,7 +1490,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/rastair.yaml"
 
-# 8f. rastair call to MethylKit (upstream: RASTAIR_METHYLKIT, label
+# 9f. rastair call to MethylKit (upstream: RASTAIR_METHYLKIT, label
 #     process_low)
 [[rules]]
 name = "rastair_methylkit"
@@ -1408,7 +1512,7 @@ time_limit = "4h"
 conda = "envs/rastair.yaml"
 
 # ---------------------------------------------------------------------------
-# 9. Coverage to cytosine report (upstream: BISMARK_COVERAGE2CYTOSINE,
+# 10. Coverage to cytosine report (upstream: BISMARK_COVERAGE2CYTOSINE,
 #    label process_low). Off by default; runs with --cytosine_report / --nomeseq.
 # ---------------------------------------------------------------------------
 [[rules]]
@@ -1448,7 +1552,7 @@ time_limit = "4h"
 conda = "envs/bismark.yaml"
 
 # ---------------------------------------------------------------------------
-# 10. Bismark sample report (upstream: BISMARK_REPORT, label process_low;
+# 11. Bismark sample report (upstream: BISMARK_REPORT, label process_low;
 #     runs bismark2report with the four per-sample reports co-located, as in
 #     the upstream workdir)
 # ---------------------------------------------------------------------------
@@ -1483,7 +1587,7 @@ time_limit = "4h"
 conda = "envs/bismark.yaml"
 
 # ---------------------------------------------------------------------------
-# 11. Bismark summary report (upstream: BISMARK_SUMMARY, label process_low;
+# 12. Bismark summary report (upstream: BISMARK_SUMMARY, label process_low;
 #     gathers all per-sample reports, passes the alignment BAM names)
 # ---------------------------------------------------------------------------
 [[rules]]
@@ -1527,10 +1631,10 @@ time_limit = "4h"
 conda = "envs/bismark.yaml"
 
 # ---------------------------------------------------------------------------
-# 12. Optional QC branches (upstream: QUALIMAP_BAMQC / PRESEQ_LCEXTRAP,
+# 13. Optional QC branches (upstream: QUALIMAP_BAMQC / PRESEQ_LCEXTRAP,
 #     off by default)
 # ---------------------------------------------------------------------------
-# 12a. Qualimap BamQC on the bismark final BAM (upstream: QUALIMAP_BAMQC,
+# 13a. Qualimap BamQC on the bismark final BAM (upstream: QUALIMAP_BAMQC,
 #      label process_medium). -p non-strand-specific (no strandedness
 #      metadata in the port); --collect-overlap-pairs for paired-end;
 #      --gff when bamqc_regions_file is set.
@@ -1567,7 +1671,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/qualimap.yaml"
 
-# 12b. Qualimap BamQC on the bwameth/bwamem final BAM (same upstream module;
+# 13b. Qualimap BamQC on the bwameth/bwamem final BAM (same upstream module;
 #      the port consumes the deduplicated BAM, which requires deduplication
 #      to have run — with skip_deduplication the branch is unavailable)
 [[rules]]
@@ -1603,7 +1707,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/qualimap.yaml"
 
-# 12c. Preseq lc_extrap on the bismark final BAM (upstream: PRESEQ_LCEXTRAP,
+# 13c. Preseq lc_extrap on the bismark final BAM (upstream: PRESEQ_LCEXTRAP,
 #      label process_single; -pe for paired-end). The port's *.command.log
 #      is preseq's stderr (upstream copies the whole task stderr).
 [[rules]]
@@ -1634,7 +1738,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/preseq.yaml"
 
-# 12d. Preseq lc_extrap on the bwameth/bwamem final BAM
+# 13d. Preseq lc_extrap on the bwameth/bwamem final BAM
 [[rules]]
 name = "preseq_lcextrap_alt"
 input = ["{config.out_dir}/{config.aligner}/deduplicated/{sample}.markdup.sorted.bam"]
@@ -1664,13 +1768,13 @@ time_limit = "4h"
 conda = "envs/preseq.yaml"
 
 # ---------------------------------------------------------------------------
-# 13. Targeted sequencing (upstream: TARGETED_SEQUENCING — bedtools
+# 14. Targeted sequencing (upstream: TARGETED_SEQUENCING — bedtools
 #     intersect + Picard HS metrics; off by default). Upstream errors when
 #     run with the rastair branches (taps / bwamem) — the port's gates
 #     reproduce that by limiting the rules to the bismark and bwameth
 #     branches.
 # ---------------------------------------------------------------------------
-# 13a. Picard CreateSequenceDictionary (upstream: PICARD_CREATESEQUENCEDICTIONARY,
+# 14a. Picard CreateSequenceDictionary (upstream: PICARD_CREATESEQUENCEDICTIONARY,
 #      label process_medium; runs only when collecthsmetrics is requested)
 [[rules]]
 name = "picard_createsequencedictionary"
@@ -1697,7 +1801,7 @@ time_limit = "8h"
 [rules.environment]
 conda = "envs/picard.yaml"
 
-# 13b. Picard BedToIntervalList for the target regions (upstream:
+# 14b. Picard BedToIntervalList for the target regions (upstream:
 #      PICARD_BEDTOINTERVALLIST, label process_low; runs only when
 #      collecthsmetrics is requested). Upstream names the output after the
 #      BED file's basename; the port uses the fixed canonical name
@@ -1729,7 +1833,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/picard.yaml"
 
-# 13c. bedtools intersect of the bismark bedGraph with the target regions
+# 14c. bedtools intersect of the bismark bedGraph with the target regions
 #      (upstream: BEDTOOLS_INTERSECT, label process_single; prefix = the
 #      bedGraph basename, suffix 'targeted.bedGraph')
 [[rules]]
@@ -1759,7 +1863,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/bedtools.yaml"
 
-# 13d. bedtools intersect of the bwameth CpG bedGraph with the target regions
+# 14d. bedtools intersect of the bwameth CpG bedGraph with the target regions
 [[rules]]
 name = "bedtools_intersect_bwameth"
 input = [
@@ -1787,7 +1891,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/bedtools.yaml"
 
-# 13e. bedtools intersect of the bwameth CHG bedGraph (all_contexts only)
+# 14e. bedtools intersect of the bwameth CHG bedGraph (all_contexts only)
 [[rules]]
 name = "bedtools_intersect_bwameth_chg"
 input = [
@@ -1815,7 +1919,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/bedtools.yaml"
 
-# 13f. bedtools intersect of the bwameth CHH bedGraph (all_contexts only)
+# 14f. bedtools intersect of the bwameth CHH bedGraph (all_contexts only)
 [[rules]]
 name = "bedtools_intersect_bwameth_chh"
 input = [
@@ -1843,7 +1947,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/bedtools.yaml"
 
-# 13g. Picard CollectHsMetrics on the bismark final BAM (upstream:
+# 14g. Picard CollectHsMetrics on the bismark final BAM (upstream:
 #      PICARD_COLLECTHSMETRICS, label process_single; the same interval list
 #      is used for bait and target, like upstream)
 [[rules]]
@@ -1881,7 +1985,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/picard.yaml"
 
-# 13h. Picard CollectHsMetrics on the bwameth final BAM (the bwamem branch
+# 14h. Picard CollectHsMetrics on the bwameth final BAM (the bwamem branch
 #      is excluded by the rastair error, like upstream)
 [[rules]]
 name = "picard_collecthsmetrics_alt"
@@ -1919,7 +2023,7 @@ time_limit = "4h"
 conda = "envs/picard.yaml"
 
 # ---------------------------------------------------------------------------
-# 14. Software versions (upstream: softwareVersionsToYAML + collectFile ->
+# 15. Software versions (upstream: softwareVersionsToYAML + collectFile ->
 #     results/pipeline_info/nf_core_methylseq_software_mqc_versions.yml).
 #     Upstream extracts versions at runtime; the port pins them statically.
 # ---------------------------------------------------------------------------
@@ -2013,12 +2117,12 @@ memory = "1G"
 time_limit = "1h"
 
 # ---------------------------------------------------------------------------
-# 15. MultiQC (upstream: MULTIQC, label process_single). One rule per
+# 16. MultiQC (upstream: MULTIQC, label process_single). One rule per
 #     aligner branch; each symlinks the always-present branch files and
 #     conditionally-added extras (qualimap dirs, preseq logs, picard
 #     metrics, methyldackel CHG/CHH/methylKit files) that exist.
 # ---------------------------------------------------------------------------
-# 15a. MultiQC, bismark branch (the main path)
+# 16a. MultiQC, bismark branch (the main path)
 [[rules]]
 name = "multiqc"
 input = []
@@ -2087,7 +2191,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/multiqc.yaml"
 
-# 15b. MultiQC, bwameth branch (methyldackel bedGraph/mbias + samtools
+# 16b. MultiQC, bwameth branch (methyldackel bedGraph/mbias + samtools
 #      stats/flagstat + picard metrics)
 [[rules]]
 name = "multiqc_bwameth"
@@ -2158,7 +2262,7 @@ time_limit = "4h"
 [rules.environment]
 conda = "envs/multiqc.yaml"
 
-# 15c. MultiQC, bwamem branch (samtools stats/flagstat/idxstats + picard
+# 16c. MultiQC, bwamem branch (samtools stats/flagstat/idxstats + picard
 #      metrics + rastair mbias/call/methylkit)
 [[rules]]
 name = "multiqc_bwamem"
