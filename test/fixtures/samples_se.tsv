@@ -1,0 +1,3 @@
+# Single-end smoke-test cohort: replace the sample set with --samples @test/fixtures/samples_se.tsv
+name	samples
+cohort	S3

@@ -12,7 +12,11 @@
 #   defaults (default flag values are reproduced with bash conditionals driven
 #   by the same [config] keys the upstream `params.*` expose).
 # - Upstream process labels (cpus/memory/time) are baked into [rules.resources].
-# - Paired-end only (upstream `single_end` samplesheet column is not ported).
+# - Single-end reads are ported (upstream samplesheet `single_end` column):
+#   per-sample endedness comes from the engine's metadata binding
+#   ([workflow] metadata_file + {meta.endedness}, oxo-flow >= 0.17.0),
+#   gated on config.single_end_mode. Off by default — every sample stays
+#   paired-end, byte-identical to the previous port.
 # - CAT_FASTQ is ported (section 2) via the engine's input_groups primitive:
 #   samples with >1 fastq pair (unit-named raw files) are concatenated into
 #   one pair before QC/trimming; single-pair samples pass through unchanged.
@@ -56,6 +60,12 @@ version = "1.0.0"
 description = "Bisulfite methylation analysis: FastQC, TrimGalore, alignment (bismark/bismark_hisat/bwameth/bwamem), deduplication, methylation calls (bismark/methyldackel/rastair), QC (qualimap/preseq), targeted-sequencing metrics, MultiQC"
 author = "oxo-flow-community"
 sample_group_name = "cohort"
+# Single-end reads (upstream samplesheet `single_end` column): uncomment and
+# set config.single_end_mode = true to route each sample by its row in
+# metadata/samples.tsv (the `endedness` column, SE or PE). The sheet is a
+# lookup only — it does not define the sample set. Requires oxo-flow >= 0.17.0
+# (the {meta.*} binding).
+# metadata_file = "metadata/samples.tsv"
 
 [config]
 # Reference genome (upstream: --fasta). Uncompressed FASTA (a .gz FASTA is
@@ -95,6 +105,19 @@ skip_multiqc = false
 # only when every sample has a single pair: multi-pair samples would then
 # lack the merged reads the downstream rules consume.
 cat_fastq = true
+# Single-end reads (upstream: the samplesheet `single_end` column, absent
+# fastq_2 -> single_end). Off by default (all samples paired-end, the
+# byte-identical default). Set to true AND uncomment [workflow]
+# metadata_file to route samples per-row: metadata/samples.tsv lists each
+# sample's `endedness` (SE or PE); a sample without a row — or with no
+# metadata_file at all — stays paired-end. The SE branches are separate
+# gated rules mirroring the upstream per-sample routing (bismark chain:
+# fastqc_se -> trimgalore_se -> bismark_align_se -> bismark_deduplicate_se
+# -> bismark_methylationextractor_se -> bismark_report_se; the bwameth/
+# bwamem aligners take the trimmed single read directly). Requires
+# oxo-flow >= 0.17.0: on older engines `{meta.*}` is inert, so the SE rules
+# stay closed while this key is false.
+single_end_mode = false
 # Library presets (upstream params with the same defaults).
 rrbs = false
 pbat = false
@@ -384,7 +407,8 @@ conda = "envs/coreutils.yaml"
 [[rules]]
 name = "cat_fastq_r2"
 description = "Concatenate the R2 fastqs of a sample's multiple pairs into one (upstream CAT_FASTQ)"
-when = "config.cat_fastq"
+# Paired-end samples only — a single-end sample has no R2 to merge.
+when = "config.cat_fastq && {meta.endedness} != 'SE'"
 input_groups = [
     { pattern = "{config.raw_dir}/{sample}_{unit}_R2.fastq.gz", group_by = "sample" },
 ]
@@ -426,8 +450,8 @@ output = [
     "{config.out_dir}/fastqc/zips/{sample}_1_fastqc.zip",
     "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip",
 ]
-description = "Run FastQC on the raw reads"
-when = "!config.skip_fastqc"
+description = "Run FastQC on the raw paired-end reads"
+when = "!config.skip_fastqc && {meta.endedness} != 'SE'"
 shell = """
 # Upstream ch_fastq mixes the CAT_FASTQ outputs with the single-pair reads:
 # use the concatenated pair when it exists (multi-pair sample), else the raw
@@ -450,6 +474,48 @@ mv {sample}_1_fastqc.html {output[0]}
 mv {sample}_2_fastqc.html {output[1]}
 mv {sample}_1_fastqc.zip {output[2]}
 mv {sample}_2_fastqc.zip {output[3]}
+"""
+
+[rules.resources]
+threads = 6
+memory = "36G"
+time_limit = "8h"
+
+[rules.environment]
+conda = "envs/fastqc.yaml"
+
+# 3b. FastQC on the raw single-end read (same upstream FASTQC module; the
+#     single read is renamed to <sample>.fastq.gz, so the outputs drop the
+#     _1/_2 suffixes, exactly like upstream)
+[[rules]]
+name = "fastqc_se"
+input = [
+    # Concatenated R1 — exists only for multi-pair samples (see cat_fastq)
+    "{config.out_dir}/fastq/{sample}_R1.fastq.gz",
+    # Raw R1 — the single-pair pass-through
+    "{config.raw_dir}/{sample}_R1.fastq.gz",
+]
+optional = "any"
+output = [
+    "{config.out_dir}/fastqc/{sample}_fastqc.html",
+    "{config.out_dir}/fastqc/zips/{sample}_fastqc.zip",
+]
+description = "Run FastQC on the raw single-end read"
+when = "config.single_end_mode && {meta.endedness} == 'SE' && !config.skip_fastqc"
+shell = """
+# Upstream renames the read to <prefix>.fastq.gz before QC (consistent
+# MultiQC naming); use the concatenated copy when it exists (multi-pair
+# sample), else the raw read, like the paired-end rule.
+r1="{input[0]}"
+[ ! -f "$r1" ] && r1="{input[1]}"
+ln -sf "$r1" {sample}.fastq.gz
+fastqc \\
+    --quiet \\
+    --threads {threads} \\
+    --memory 6144 \\
+    {sample}.fastq.gz
+mv {sample}_fastqc.html {output[0]}
+mv {sample}_fastqc.zip {output[1]}
 """
 
 [rules.resources]
@@ -485,7 +551,7 @@ output = [
     "{config.out_dir}/trimgalore/fastqc/zips/{sample}_2_val_2_fastqc.zip",
 ]
 description = "Trim adapters with TrimGalore (paired-end, --fastqc)"
-when = "!config.skip_trimming"
+when = "!config.skip_trimming && {meta.endedness} != 'SE'"
 shell = """
 args="--fastqc"
 [ "{config.rrbs}" = "true" ] && args="$args --rrbs"
@@ -580,6 +646,86 @@ time_limit = "16h"
 [rules.environment]
 conda = "envs/trimgalore.yaml"
 
+# 4b. TrimGalore on the single-end read (same upstream TRIMGALORE module:
+#     the read is renamed to <sample>.fastq.gz, the R2-side clipping args
+#     are skipped — the upstream module strips *_r2 args — and the cores
+#     clamp is cpus - 3 instead of cpus - 4)
+[[rules]]
+name = "trimgalore_se"
+input = [
+    # Concatenated R1 — exists only for multi-pair samples (see cat_fastq)
+    "{config.out_dir}/fastq/{sample}_R1.fastq.gz",
+    # Raw R1 — the single-pair pass-through
+    "{config.raw_dir}/{sample}_R1.fastq.gz",
+]
+optional = "any"
+output = [
+    "{config.out_dir}/trimgalore/{sample}_trimmed.fq.gz",
+    "{config.out_dir}/trimgalore/logs/{sample}.fastq.gz_trimming_report.txt",
+    "{config.out_dir}/trimgalore/fastqc/{sample}_trimmed_fastqc.html",
+    "{config.out_dir}/trimgalore/fastqc/zips/{sample}_trimmed_fastqc.zip",
+]
+description = "Trim adapters with TrimGalore (single-end, --fastqc)"
+when = "config.single_end_mode && {meta.endedness} == 'SE' && !config.skip_trimming"
+shell = """
+args="--fastqc"
+[ "{config.rrbs}" = "true" ] && args="$args --rrbs"
+[ {config.nextseq_trim} -gt 0 ] && args="$args --nextseq {config.nextseq_trim}"
+[ {config.length_trim} -gt 0 ] && args="$args --length {config.length_trim}"
+# 5' clipping R1 (upstream: clip_r1 > 0, else library preset); the R2-side
+# clipping args are paired-end only, exactly like the upstream module
+if [ {config.clip_r1} -gt 0 ]; then
+    args="$args --clip_r1 {config.clip_r1}"
+elif [ "{config.skip_trimming_presets}" != "true" ]; then
+    if [ "{config.pbat}" = "true" ]; then
+        args="$args --clip_r1 8"
+    elif [ "{config.single_cell}" = "true" ]; then
+        args="$args --clip_r1 6"
+    elif [ "{config.accel}" = "true" ] || [ "{config.zymo}" = "true" ] || [ "{config.em_seq}" = "true" ]; then
+        args="$args --clip_r1 10"
+    fi
+fi
+# 3' clipping R1
+if [ {config.three_prime_clip_r1} -gt 0 ]; then
+    args="$args --three_prime_clip_r1 {config.three_prime_clip_r1}"
+elif [ "{config.skip_trimming_presets}" != "true" ]; then
+    if [ "{config.pbat}" = "true" ]; then
+        args="$args --three_prime_clip_r1 8"
+    elif [ "{config.single_cell}" = "true" ]; then
+        args="$args --three_prime_clip_r1 6"
+    elif [ "{config.accel}" = "true" ] || [ "{config.zymo}" = "true" ] || [ "{config.em_seq}" = "true" ]; then
+        args="$args --three_prime_clip_r1 10"
+    fi
+fi
+# Upstream cores = cpus - 3 (single-end), clamped to [1, 8]; cpus = 12 -> 8
+cores=$(({threads} - 3))
+[ $cores -lt 1 ] && cores=1
+[ $cores -gt 8 ] && cores=8
+# Use the concatenated read when it exists (multi-pair sample), else the raw
+# read (the single-pair pass-through), like the paired-end rule.
+r1="{input[0]}"
+[ ! -f "$r1" ] && r1="{input[1]}"
+# Soft-link to the original fastq for consistent naming in MultiQC
+ln -sf "$r1" {sample}.fastq.gz
+trim_galore \\
+    $args \\
+    --cores $cores \\
+    --gzip \\
+    {sample}.fastq.gz
+mv {sample}_trimmed.fq.gz {output[0]}
+mv {sample}.fastq.gz_trimming_report.txt {output[1]}
+mv {sample}_trimmed_fastqc.html {output[2]}
+mv {sample}_trimmed_fastqc.zip {output[3]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "16h"
+
+[rules.environment]
+conda = "envs/trimgalore.yaml"
+
 # ---------------------------------------------------------------------------
 # 5. Alignment (upstream: BISMARK_ALIGN / BWAMETH_ALIGN / BWA_MEM)
 # ---------------------------------------------------------------------------
@@ -599,7 +745,7 @@ output = [
     "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt",
 ]
 description = "Align trimmed reads with Bismark (bowtie2 by default, hisat2 for bismark_hisat, paired-end)"
-when = "config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\""
+when = "(config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\") && {meta.endedness} != 'SE'"
 depends_on = ["bismark_genomepreparation", "bismark_untar"]
 shell = """
 args=""
@@ -660,17 +806,90 @@ time_limit = "192h"
 [rules.environment]
 conda = "envs/bismark.yaml"
 
+# 5a2. Bismark alignment of the single-end read (same upstream BISMARK_ALIGN
+#      module: reads passed positionally, no --minins/--maxins — the
+#      upstream config gates them on !single_end — and the upstream
+#      _bismark_bt2_SE_report.txt naming)
+[[rules]]
+name = "bismark_align_se"
+input = [
+    "{config.out_dir}/trimgalore/{sample}_trimmed.fq.gz",
+    "refs/BismarkIndex",
+]
+output = [
+    "{config.out_dir}/bismark/alignments/{sample}_trimmed_bismark_bt2.bam",
+    "{config.out_dir}/bismark/alignments/logs/{sample}_trimmed_bismark_bt2_SE_report.txt",
+]
+description = "Align the trimmed single-end read with Bismark (bowtie2 by default, hisat2 for bismark_hisat)"
+when = "config.single_end_mode && {meta.endedness} == 'SE' && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
+depends_on = ["bismark_genomepreparation", "bismark_untar"]
+shell = """
+args=""
+if [ "{config.aligner}" = "bismark_hisat" ]; then
+    args="--hisat2"
+else
+    args="--bowtie2"
+fi
+if [ "{config.aligner}" = "bismark_hisat" ] && [ -n "{config.known_splices}" ]; then
+    # Upstream: --known-splicesite-infile <(hisat2_extract_splice_sites.py ...)
+    # (process substitution); the port materializes the same list to a file.
+    hisat2_extract_splice_sites.py {config.known_splices} > known_splices.txt
+    args="$args --known-splicesite-infile known_splices.txt"
+fi
+[ "{config.pbat}" = "true" ] && args="$args --pbat"
+if [ "{config.single_cell}" = "true" ] || [ "{config.non_directional}" = "true" ] || [ "{config.zymo}" = "true" ]; then
+    args="$args --non_directional"
+fi
+[ "{config.unmapped}" = "true" ] && args="$args --unmapped"
+[ "{config.relax_mismatches}" = "true" ] && args="$args --score_min L,0,-{config.num_mismatches}"
+[ "{config.local_alignment}" = "true" ] && args="$args --local"
+# No --minins/--maxins for single-end (upstream: !meta.single_end && params.*)
+# Upstream --multicore: ccore = min(cpus/3, mem/13GB); rule memory = 72G -> 5
+ccore=$(({threads} / 3))
+[ $ccore -gt 5 ] && ccore=5
+if [ $ccore -gt 1 ]; then
+    args="$args --multicore $ccore"
+fi
+bismark \\
+    {input[0]} \\
+    --genome {input[1]} \\
+    --bam \\
+    $args
+# bismark_hisat names its outputs with a _bismark_hisat2_ infix; the port
+# renames them to the canonical bt2-style names (cosmetic deviation, same as
+# the paired-end rule).
+if [ "{config.aligner}" = "bismark_hisat" ]; then
+    mv {sample}_trimmed_bismark_hisat2.bam {output[0]}
+    mv {sample}_trimmed_bismark_hisat2_SE_report.txt {output[1]}
+else
+    mv {sample}_trimmed_bismark_bt2.bam {output[0]}
+    mv {sample}_trimmed_bismark_bt2_SE_report.txt {output[1]}
+fi
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "192h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
 # 5b. bwameth alignment (upstream: BWAMETH_ALIGN, label process_high,
 #     time override 6d; active on the bwameth branch).
 [[rules]]
 name = "bwameth_align"
 input = [
+    # Paired-end trimmed pair (index 0/1) or the single-end trimmed read
+    # (index 2) — selected per sample by its metadata row
     "{config.out_dir}/trimgalore/{sample}_1_val_1.fq.gz",
     "{config.out_dir}/trimgalore/{sample}_2_val_2.fq.gz",
+    "{config.out_dir}/trimgalore/{sample}_trimmed.fq.gz",
     "refs/BwamethIndex",
 ]
+optional = "any"
 output = ["{config.out_dir}/bwameth/alignments/{sample}.bam"]
-description = "Align trimmed reads with bwameth (bwa-meth)"
+description = "Align trimmed reads with bwameth (bwa-meth, paired-end or single-end)"
 when = "config.aligner == \"bwameth\""
 depends_on = ["bwameth_index"]
 shell = """
@@ -681,11 +900,13 @@ if [[ {config.fasta} == *.gz ]]; then
 fi
 # Upstream re-creates the fasta symlink inside the index dir before aligning
 ln -sf "$PWD"/{config.fasta} "refs/BwamethIndex/$fa"
+# Single-end samples (upstream meta.single_end) pass one read positionally
+reads="{input[0]} {input[1]}"
+[ "{meta.endedness}" = "SE" ] && reads="{input[2]}"
 bwameth.py \\
     -t {threads} \\
     --reference "refs/BwamethIndex/$fa" \\
-    {input[0]} \\
-    {input[1]} \\
+    $reads \\
     | samtools view -@ {threads} -bhS -o {sample}.bam -
 mv {sample}.bam {output[0]}
 """
@@ -704,21 +925,27 @@ conda = "envs/bwameth.yaml"
 [[rules]]
 name = "bwa_mem"
 input = [
+    # Paired-end trimmed pair (index 0/1) or the single-end trimmed read
+    # (index 2) — selected per sample by its metadata row
     "{config.out_dir}/trimgalore/{sample}_1_val_1.fq.gz",
     "{config.out_dir}/trimgalore/{sample}_2_val_2.fq.gz",
+    "{config.out_dir}/trimgalore/{sample}_trimmed.fq.gz",
     "refs/BwaMemIndex",
 ]
+optional = "any"
 output = ["{config.out_dir}/bwamem/alignments/{sample}.bam"]
-description = "Align trimmed reads with BWA-MEM and sort (upstream BWA_MEM)"
+description = "Align trimmed reads with BWA-MEM and sort (upstream BWA_MEM, paired-end or single-end)"
 when = "config.aligner == \"bwamem\""
 depends_on = ["bwa_index"]
 shell = """
 INDEX=$(find -L refs/BwaMemIndex -name "*.amb" | sed 's/\\.amb$//')
+# Single-end samples (upstream meta.single_end) pass one read positionally
+reads="{input[0]} {input[1]}"
+[ "{meta.endedness}" = "SE" ] && reads="{input[2]}"
 bwa mem \\
     -t {threads} \\
     "$INDEX" \\
-    {input[0]} \\
-    {input[1]} \\
+    $reads \\
     | samtools sort --threads {threads} -o {sample}.bam -
 mv {sample}.bam {output[0]}
 """
@@ -740,13 +967,21 @@ conda = "envs/bwa.yaml"
 #     label process_medium; prefix = <sample>.deduplicated.sorted)
 [[rules]]
 name = "samtools_sort"
-input = ["{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bam"]
+input = [
+    # Paired-end dedup BAM (index 0) or the single-end one (index 1) —
+    # selected per sample by its metadata row; both share the sorted name
+    "{config.out_dir}/bismark/deduplicated/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bam",
+    "{config.out_dir}/bismark/deduplicated/{sample}_trimmed_bismark_bt2.deduplicated.bam",
+]
+optional = "any"
 output = ["{config.out_dir}/bismark/deduplicated/{sample}.deduplicated.sorted.bam"]
-description = "Sort the deduplicated Bismark BAM with samtools"
+description = "Sort the deduplicated Bismark BAM with samtools (paired-end or single-end)"
 when = "config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\""
 shell = """
+bam="{input[0]}"
+[ "{meta.endedness}" = "SE" ] && bam="{input[1]}"
 samtools cat \\
-    {input[0]} \\
+    "$bam" \\
 | \\
 samtools sort \\
     -T {sample}.deduplicated.sorted \\
@@ -931,13 +1166,41 @@ output = [
     "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt",
 ]
 description = "Remove PCR duplicates with deduplicate_bismark (paired-end)"
-when = "!config.skip_deduplication && !config.rrbs && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
+when = "!config.skip_deduplication && !config.rrbs && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\") && {meta.endedness} != 'SE'"
 shell = """
 deduplicate_bismark \\
     -p \\
     --bam {input[0]}
 mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bam {output[0]}
 mv {sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt {output[1]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "48h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# 7a2. Deduplicate the single-end bismark alignment (same upstream
+#      BISMARK_DEDUPLICATE module: -s instead of -p; output basenames follow
+#      the input BAM, {sample}_trimmed_bismark_bt2)
+[[rules]]
+name = "bismark_deduplicate_se"
+input = ["{config.out_dir}/bismark/alignments/{sample}_trimmed_bismark_bt2.bam"]
+output = [
+    "{config.out_dir}/bismark/deduplicated/{sample}_trimmed_bismark_bt2.deduplicated.bam",
+    "{config.out_dir}/bismark/deduplicated/logs/{sample}_trimmed_bismark_bt2.deduplication_report.txt",
+]
+description = "Remove PCR duplicates with deduplicate_bismark (single-end)"
+when = "config.single_end_mode && {meta.endedness} == 'SE' && !config.skip_deduplication && !config.rrbs && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
+shell = """
+deduplicate_bismark \\
+    -s \\
+    --bam {input[0]}
+mv {sample}_trimmed_bismark_bt2.deduplicated.bam {output[0]}
+mv {sample}_trimmed_bismark_bt2.deduplication_report.txt {output[1]}
 """
 
 [rules.resources]
@@ -1128,7 +1391,7 @@ output = [
     "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt",
 ]
 description = "Extract per-context methylation calls, bedGraph and coverage with bismark_methylation_extractor (paired-end)"
-when = "config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\""
+when = "(config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\") && {meta.endedness} != 'SE'"
 shell = """
 args=""
 [ "{config.comprehensive}" = "true" ] && args="$args --comprehensive"
@@ -1163,6 +1426,62 @@ mv CHH_context_{sample}_1_val_1_bismark_bt2_pe.deduplicated.txt.gz {output[3]}
 mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz {output[4]}
 mv {sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt {output[5]}
 mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt {output[6]}
+"""
+
+[rules.resources]
+threads = 12
+memory = "72G"
+time_limit = "24h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# 8a2. Bismark methylation extraction of the single-end deduplicated BAM
+#      (same upstream BISMARK_METHYLATIONEXTRACTOR module: -s instead of -p;
+#      the paired-end-only flags --no_overlap/--include_overlap, --ignore_r2
+#      and --ignore_3prime_r2 are skipped, exactly like the upstream config's
+#      meta.single_end gating)
+[[rules]]
+name = "bismark_methylationextractor_se"
+input = ["{config.out_dir}/bismark/deduplicated/{sample}_trimmed_bismark_bt2.deduplicated.bam"]
+output = [
+    "{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_trimmed_bismark_bt2.deduplicated.bedGraph.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_trimmed_bismark_bt2.deduplicated_CpG.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_trimmed_bismark_bt2.deduplicated_CHG.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_calls/{sample}_trimmed_bismark_bt2.deduplicated_CHH.txt.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_trimmed_bismark_bt2.deduplicated.bismark.cov.gz",
+    "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_trimmed_bismark_bt2.deduplicated_splitting_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_trimmed_bismark_bt2.deduplicated.M-bias.txt",
+]
+description = "Extract per-context methylation calls, bedGraph and coverage with bismark_methylation_extractor (single-end)"
+when = "config.single_end_mode && {meta.endedness} == 'SE' && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
+shell = """
+args=""
+[ "{config.comprehensive}" = "true" ] && args="$args --comprehensive"
+[ -n "{config.meth_cutoff}" ] && args="$args --cutoff {config.meth_cutoff}"
+[ "{config.nomeseq}" = "true" ] && args="$args --CX"
+[ {config.ignore_r1} -gt 0 ] && args="$args --ignore {config.ignore_r1}"
+[ {config.ignore_3prime_r1} -gt 0 ] && args="$args --ignore_3prime {config.ignore_3prime_r1}"
+# Upstream: --multicore when cpus >= 6 (here 12 -> 4); --buffer_size = mem - 2G (72G -> 70G)
+if [ {threads} -ge 6 ]; then
+    args="$args --multicore $(({threads} / 3))"
+fi
+args="$args --buffer_size 70G"
+bismark_methylation_extractor \\
+    {input[0]} \\
+    --bedGraph \\
+    --counts \\
+    --gzip \\
+    --report \\
+    -s \\
+    $args
+mv {sample}_trimmed_bismark_bt2.deduplicated.bedGraph.gz {output[0]}
+mv CpG_context_{sample}_trimmed_bismark_bt2.deduplicated.txt.gz {output[1]}
+mv CHG_context_{sample}_trimmed_bismark_bt2.deduplicated.txt.gz {output[2]}
+mv CHH_context_{sample}_trimmed_bismark_bt2.deduplicated.txt.gz {output[3]}
+mv {sample}_trimmed_bismark_bt2.deduplicated.bismark.cov.gz {output[4]}
+mv {sample}_trimmed_bismark_bt2.deduplicated_splitting_report.txt {output[5]}
+mv {sample}_trimmed_bismark_bt2.deduplicated.M-bias.txt {output[6]}
 """
 
 [rules.resources]
@@ -1518,9 +1837,13 @@ conda = "envs/rastair.yaml"
 [[rules]]
 name = "bismark_coverage2cytosine"
 input = [
+    # Paired-end coverage (index 0) or the single-end one (index 1) —
+    # selected per sample by its metadata row; both share the {sample} outputs
     "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz",
+    "{config.out_dir}/bismark/methylation_calls/methylation_coverage/{sample}_trimmed_bismark_bt2.deduplicated.bismark.cov.gz",
     "refs/BismarkIndex",
 ]
+optional = "any"
 output = [
     "{config.out_dir}/bismark/coverage2cytosine/reports/{sample}.report.txt.gz",
     "{config.out_dir}/bismark/coverage2cytosine/summaries/{sample}.cytosine_context_summary.txt",
@@ -1530,11 +1853,13 @@ description = "Convert coverage files to genome-wide cytosine reports (coverage2
 when = "(config.cytosine_report || config.nomeseq) && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
 depends_on = ["bismark_genomepreparation", "bismark_untar"]
 shell = """
+cov="{input[0]}"
+[ "{meta.endedness}" = "SE" ] && cov="{input[1]}"
 args=""
 [ "{config.nomeseq}" = "true" ] && args="$args --nome-seq"
 coverage2cytosine \\
-    {input[0]} \\
-    --genome {input[1]} \\
+    "$cov" \\
+    --genome {input[2]} \\
     --output {sample} \\
     --gzip \\
     $args
@@ -1565,8 +1890,8 @@ input = [
     "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt",
 ]
 output = ["{config.out_dir}/bismark/reports/{sample}_1_val_1_bismark_bt2_PE_report.html"]
-description = "Generate the per-sample Bismark HTML report with bismark2report"
-when = "config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\""
+description = "Generate the per-sample Bismark HTML report with bismark2report (paired-end)"
+when = "(config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\") && {meta.endedness} != 'SE'"
 shell = """
 rm -rf report_work/{sample}
 mkdir -p report_work/{sample}
@@ -1576,6 +1901,38 @@ for f in {input}; do
 done
 (cd report_work/{sample} && bismark2report)
 mv report_work/{sample}/{sample}_1_val_1_bismark_bt2_PE_report.html {output[0]}
+"""
+
+[rules.resources]
+threads = 2
+memory = "12G"
+time_limit = "4h"
+
+[rules.environment]
+conda = "envs/bismark.yaml"
+
+# 11b. Bismark sample report for the single-end chain (same upstream
+#      BISMARK_REPORT module; the SE report names end in _SE_report.html)
+[[rules]]
+name = "bismark_report_se"
+input = [
+    "{config.out_dir}/bismark/alignments/logs/{sample}_trimmed_bismark_bt2_SE_report.txt",
+    "{config.out_dir}/bismark/deduplicated/logs/{sample}_trimmed_bismark_bt2.deduplication_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_trimmed_bismark_bt2.deduplicated_splitting_report.txt",
+    "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_trimmed_bismark_bt2.deduplicated.M-bias.txt",
+]
+output = ["{config.out_dir}/bismark/reports/{sample}_trimmed_bismark_bt2_SE_report.html"]
+description = "Generate the per-sample Bismark HTML report with bismark2report (single-end)"
+when = "config.single_end_mode && {meta.endedness} == 'SE' && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
+shell = """
+rm -rf report_work/{sample}
+mkdir -p report_work/{sample}
+# Absolute symlink targets: bismark2report searches its working directory
+for f in {input}; do
+    ln -sf "$PWD/$f" report_work/{sample}/
+done
+(cd report_work/{sample} && bismark2report)
+mv report_work/{sample}/{sample}_trimmed_bismark_bt2_SE_report.html {output[0]}
 """
 
 [rules.resources]
@@ -1598,12 +1955,18 @@ expand_inputs = [
     { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
+    # Single-end samples carry the _trimmed_ infix (upstream per-sample routing)
+    { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_trimmed_bismark_bt2_SE_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_trimmed_bismark_bt2.deduplication_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_trimmed_bismark_bt2.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_trimmed_bismark_bt2.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
 ]
+optional = "any"
 output = [
     "{config.out_dir}/bismark/summary/bismark_summary_report.html",
     "{config.out_dir}/bismark/summary/bismark_summary_report.txt",
 ]
-description = "Generate the project-wide Bismark summary report with bismark2summary"
+description = "Generate the project-wide Bismark summary report with bismark2summary (mixed single-end/paired-end cohorts)"
 when = "config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\""
 shell = """
 rm -rf summary_work
@@ -1612,10 +1975,17 @@ mkdir -p summary_work
 for f in {input}; do
     ln -sf "$PWD/$f" summary_work/
 done
-# Upstream passes the alignment BAM file names (not the files themselves)
+# Upstream passes the alignment BAM file names (not the files themselves);
+# a sample is single-end exactly when its SE alignment report was symlinked
+# above (this rule has no per-sample binding, so per-sample metadata is not
+# available here — the [ -f ] probe is the equivalent)
 bams=""
 for s in $(echo {config.samples_list} | tr ',' ' '); do
-    bams="$bams ${s}_1_val_1_bismark_bt2_pe.bam"
+    if [ -f "summary_work/${s}_trimmed_bismark_bt2_SE_report.txt" ]; then
+        bams="$bams ${s}_trimmed_bismark_bt2.bam"
+    else
+        bams="$bams ${s}_1_val_1_bismark_bt2_pe.bam"
+    fi
 done
 (cd summary_work && bismark2summary $bams)
 mv summary_work/bismark_summary_report.html {output[0]}
@@ -1650,13 +2020,14 @@ mkdir -p tmp
 export _JAVA_OPTIONS=-Djava.io.tmpdir=./tmp
 args=""
 [ -n "{config.bamqc_regions_file}" ] && args="$args --gff {config.bamqc_regions_file}"
+# --collect-overlap-pairs is paired-end only (upstream meta.single_end)
+[ "{meta.endedness}" != "SE" ] && args="$args --collect-overlap-pairs"
 qualimap \\
     --java-mem-size=29491M \\
     bamqc \\
     $args \\
     -bam {input[0]} \\
     -p non-strand-specific \\
-    --collect-overlap-pairs \\
     -outdir {sample} \\
     -nt {threads}
 rm -rf {output[0]}
@@ -1686,13 +2057,14 @@ mkdir -p tmp
 export _JAVA_OPTIONS=-Djava.io.tmpdir=./tmp
 args=""
 [ -n "{config.bamqc_regions_file}" ] && args="$args --gff {config.bamqc_regions_file}"
+# --collect-overlap-pairs is paired-end only (upstream meta.single_end)
+[ "{meta.endedness}" != "SE" ] && args="$args --collect-overlap-pairs"
 qualimap \\
     --java-mem-size=29491M \\
     bamqc \\
     $args \\
     -bam {input[0]} \\
     -p non-strand-specific \\
-    --collect-overlap-pairs \\
     -outdir {sample} \\
     -nt {threads}
 rm -rf {output[0]}
@@ -1720,10 +2092,13 @@ output = [
 description = "Estimate library complexity with preseq lc_extrap (bismark branch)"
 when = "config.run_preseq && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
 shell = """
+# -pe is paired-end only (upstream meta.single_end)
+pe="-pe"
+[ "{meta.endedness}" = "SE" ] && pe=""
 preseq \\
     lc_extrap \\
     -verbose -bam \\
-    -pe \\
+    $pe \\
     -output {sample}.lc_extrap.txt \\
     {input[0]} 2> {sample}.command.log
 mv {sample}.lc_extrap.txt {output[0]}
@@ -1749,10 +2124,13 @@ output = [
 description = "Estimate library complexity with preseq lc_extrap (bwameth/bwamem branches)"
 when = "config.run_preseq && (config.aligner == \"bwameth\" || config.aligner == \"bwamem\")"
 shell = """
+# -pe is paired-end only (upstream meta.single_end)
+pe="-pe"
+[ "{meta.endedness}" = "SE" ] && pe=""
 preseq \\
     lc_extrap \\
     -verbose -bam \\
-    -pe \\
+    $pe \\
     -output {sample}.lc_extrap.txt \\
     {input[0]} 2> {sample}.command.log
 mv {sample}.lc_extrap.txt {output[0]}
@@ -1839,20 +2217,29 @@ conda = "envs/picard.yaml"
 [[rules]]
 name = "bedtools_intersect"
 input = [
+    # Paired-end bedGraph (index 0) or the single-end one (index 1) —
+    # selected per sample by its metadata row
     "{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.gz",
+    "{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_trimmed_bismark_bt2.deduplicated.bedGraph.gz",
     "{config.target_regions_file}",
 ]
 output = ["{config.out_dir}/bismark/methylation_calls/bedGraph/{sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.targeted.bedGraph"]
 description = "Filter the bismark bedGraph to the targeted regions with bedtools intersect"
 when = "config.run_targeted_sequencing && !config.taps && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
-optional = true
+optional = "any"
 shell = """
+bedgraph="{input[0]}"
+[ "{meta.endedness}" = "SE" ] && bedgraph="{input[1]}"
+# Upstream prefixes the output with the bedGraph basename; the port renames
+# it to the fixed canonical name (documented deviation, same as
+# picard_bedtointervallist)
+targeted="$(basename "$bedgraph" .gz).targeted.bedGraph"
 bedtools \\
     intersect \\
-    -a {input[0]} \\
-    -b {input[1]} \\
-    > {sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.targeted.bedGraph
-mv {sample}_1_val_1_bismark_bt2_pe.deduplicated.bedGraph.targeted.bedGraph {output[0]}
+    -a "$bedgraph" \\
+    -b {input[2]} \\
+    > "$targeted"
+mv "$targeted" {output[0]}
 """
 
 [rules.resources]
@@ -2129,13 +2516,20 @@ input = []
 expand_inputs = [
     { pattern = "{config.out_dir}/fastqc/zips/{sample}_1_fastqc.zip", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_fastqc.zip", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/trimgalore/logs/{sample}_1.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/trimgalore/logs/{sample}_2.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_1_val_1_bismark_bt2_PE_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/alignments/logs/{sample}_trimmed_bismark_bt2_SE_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_1_val_1_bismark_bt2_pe.deduplication_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/deduplicated/logs/{sample}_trimmed_bismark_bt2.deduplication_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/splitting_report/{sample}_trimmed_bismark_bt2.deduplicated_splitting_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/methylation_calls/mbias/{sample}_trimmed_bismark_bt2.deduplicated.M-bias.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/reports/{sample}_1_val_1_bismark_bt2_PE_report.html", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/bismark/reports/{sample}_trimmed_bismark_bt2_SE_report.html", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bismark/summary/bismark_summary_report.html", variables = {} },
     { pattern = "{config.out_dir}/bismark/summary/bismark_summary_report.txt", variables = {} },
     { pattern = "{config.out_dir}/pipeline_info/nf_core_methylseq_software_mqc_versions.yml", variables = {} },
@@ -2146,7 +2540,9 @@ output = [
 ]
 description = "Collate all reports with MultiQC (bismark branch)"
 when = "!config.skip_multiqc && (config.aligner == \"bismark\" || config.aligner == \"bismark_hisat\")"
-optional = true
+# "any": run when at least one branch's files exist — a single-end sample has
+# no paired-end files and vice versa, and skip_* flags remove whole groups
+optional = "any"
 shell = """
 rm -rf multiqc_work multiqc_data
 mkdir -p multiqc_work
@@ -2199,8 +2595,10 @@ input = []
 expand_inputs = [
     { pattern = "{config.out_dir}/fastqc/zips/{sample}_1_fastqc.zip", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_fastqc.zip", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/trimgalore/logs/{sample}_1.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/trimgalore/logs/{sample}_2.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bwameth/alignments/samtools_stats/{sample}.flagstat", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bwameth/alignments/samtools_stats/{sample}.stats", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/pipeline_info/nf_core_methylseq_software_mqc_versions.yml", variables = {} },
@@ -2211,7 +2609,9 @@ output = [
 ]
 description = "Collate all reports with MultiQC (bwameth branch)"
 when = "!config.skip_multiqc && config.aligner == \"bwameth\""
-optional = true
+# "any": run when at least one branch's files exist — a single-end sample has
+# no paired-end files and vice versa, and skip_* flags remove whole groups
+optional = "any"
 shell = """
 rm -rf multiqc_work multiqc_data
 mkdir -p multiqc_work
@@ -2270,8 +2670,10 @@ input = []
 expand_inputs = [
     { pattern = "{config.out_dir}/fastqc/zips/{sample}_1_fastqc.zip", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/fastqc/zips/{sample}_2_fastqc.zip", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/fastqc/zips/{sample}_fastqc.zip", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/trimgalore/logs/{sample}_1.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/trimgalore/logs/{sample}_2.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
+    { pattern = "{config.out_dir}/trimgalore/logs/{sample}.fastq.gz_trimming_report.txt", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.flagstat", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.stats", variables = { sample = "config.samples_list" } },
     { pattern = "{config.out_dir}/bwamem/alignments/samtools_stats/{sample}.idxstats", variables = { sample = "config.samples_list" } },
@@ -2283,7 +2685,9 @@ output = [
 ]
 description = "Collate all reports with MultiQC (bwamem branch)"
 when = "!config.skip_multiqc && config.aligner == \"bwamem\""
-optional = true
+# "any": run when at least one branch's files exist — a single-end sample has
+# no paired-end files and vice versa, and skip_* flags remove whole groups
+optional = "any"
 shell = """
 rm -rf multiqc_work multiqc_data
 mkdir -p multiqc_work

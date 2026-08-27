@@ -1,0 +1,12 @@
+# Engine per-run state (checkpoints, logs)
+.oxo-flow/
+
+# test/run.sh materializes the single-end variant from main.oxoflow
+.se-tmp.oxoflow
+
+# Live-run artifacts (results/, workdirs, built indexes)
+results/
+refs/
+S3.fastq.gz
+*_work/
+multiqc_plots/
