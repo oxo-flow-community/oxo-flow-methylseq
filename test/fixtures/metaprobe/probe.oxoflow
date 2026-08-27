@@ -1,0 +1,18 @@
+# Engine capability probe: does this oxo-flow resolve {meta.*} from
+# [workflow] metadata_file? Released engines < 0.17.0 leave the placeholder
+# literally in place; the resolved engine prints out/S1.SE.txt. test/run.sh
+# skips the single-end dry-run when the placeholder survives.
+[workflow]
+name = "metaprobe"
+metadata_file = "meta.tsv"
+
+[[sample_groups]]
+name = "cohort"
+samples = ["S1"]
+
+[[rules]]
+name = "probe"
+input = ["raw/{sample}.txt"]
+output = ["out/{sample}.{meta.val}.txt"]
+when = "{meta.val} == 'SE'"
+shell = "cp {input[0]} {output[0]}"

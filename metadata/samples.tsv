@@ -1,0 +1,10 @@
+# Per-sample endedness lookup for single-end mode (upstream samplesheet
+# `single_end` column). To enable: uncomment [workflow] metadata_file in
+# main.oxoflow, set config.single_end_mode = true, and list your samples
+# here — a sample without a row stays paired-end. The sheet is a lookup
+# only; the sample set comes from the [[sample_groups]] table (or
+# --samples @...).
+sample	endedness
+S1	PE
+S2	PE
+S3	SE
