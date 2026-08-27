@@ -21,10 +21,13 @@ all-context (CHG/CHH) calls.
 
 ### 1. Install oxo-flow
 
-Requires **oxo-flow >= 0.14.0** (the picard rules size `-Xmx` from the
-`{effective_memory_mb}` placeholder, added in 0.14.0). Recommended: the
-prebuilt release binary for
-Linux x86_64:
+Requires **oxo-flow >= 0.17.0** (the `cat_fastq` rules use the
+`input_groups` primitive, added in 0.17.0; the picard rules size `-Xmx`
+from the `{effective_memory_mb}` placeholder, added in 0.14.0). On older
+engines `input_groups` is a no-op and the `cat_fastq` rules fail loudly
+instead of writing empty fastqs — upgrade, or keep every sample to a single
+pair and set `cat_fastq = false`. Recommended: the prebuilt release binary
+for Linux x86_64:
 
 ```bash
 curl -fL -o oxo-flow.tar.gz \
@@ -62,7 +65,12 @@ cd oxo-flow-methylseq
 - **Input reads** — paired-end FASTQ.gz files named
   `<dir>/<sample>_R1.fastq.gz` and `<dir>/<sample>_R2.fastq.gz`, with
   `config.raw_dir` set to that directory (default: the bundled fixtures in
-  `test/fixtures/raw`).
+  `test/fixtures/raw`). Samples with **more than one pair** (upstream
+  `CAT_FASTQ` support) name their pairs with a unit segment —
+  `<dir>/<sample>_<unit>_R1.fastq.gz` and `<dir>/<sample>_<unit>_R2.fastq.gz`
+  per unit — and the port concatenates all units of a sample into one pair
+  before QC/trimming, exactly like the upstream `ch_samplesheet.multiple`
+  branch. Single-pair samples are untouched (upstream `ch_samplesheet.single`).
 - **Compute** — up to 12 CPUs / 72 GB RAM per rule, the maximum across the
   heavy rules (`bismark_genomepreparation`, `trimgalore`, `bismark_align`,
   `bismark_deduplicate`, `bismark_methylationextractor`, `bwameth_index`,
@@ -82,6 +90,8 @@ cd oxo-flow-methylseq
 ```bash
 # 1. install oxo-flow (see Requirements)
 # 2. prepare data: <dir>/<sample>_R1.fastq.gz / <dir>/<sample>_R2.fastq.gz
+#    (multi-pair samples: <dir>/<sample>_<unit>_R1.fastq.gz / _R2.fastq.gz
+#    per unit — all units are concatenated before QC/trimming)
 #    and point config.raw_dir at that dir (default: the bundled fixtures
 #    in test/fixtures/raw; config.fasta defaults to the bundled tiny genome)
 # 3. preview the plan
@@ -99,7 +109,9 @@ Configuration lives in the `[config]` table at the top of `main.oxoflow`.
 controls where results are written. The upstream parameter set is reproduced
 as config keys with the same defaults: the aligner (`aligner`, default
 `bismark`; also `bismark_hisat`, `bwameth`, `bwamem`), skip flags
-(`skip_fastqc`/`skip_trimming`/`skip_deduplication`/`skip_multiqc`), library
+(`skip_fastqc`/`skip_trimming`/`skip_deduplication`/`skip_multiqc`),
+multi-pair concatenation (`cat_fastq`, default `true` — set `false` only
+when every sample has a single pair), library
 presets (`rrbs`, `pbat`, `single_cell`, `zymo`, `accel`, `em_seq`, `slamseq`),
 Bismark options (`cytosine_report`, `nomeseq`, `comprehensive`, `no_overlap`,
 `ignore_r1/r2`, `num_mismatches`, ...), trimming options (`clip_r1/r2`,
@@ -192,7 +204,7 @@ releases. Full upstream attribution in [NOTICE.md](NOTICE.md).
 | SAMTOOLS_FAIDX | `samtools_faidx` | samtools 1.22.1, htslib 1.22.1, gzip 1.13 | stages the reference at `refs/FastaRef/reference.fa`; upstream gate (bwameth/bwamem/collecthsmetrics) reproduced |
 | MULTIQC | `multiqc` / `multiqc_bwameth` / `multiqc_bwamem` | multiqc 1.32 | one rule per aligner branch; same search space as upstream (fastqc zips, trimgalore logs, samtools stats/flagstat/idxstats, picard metrics + qualimap/preseq/HS extras); the methyldackel/rastair outputs are not fed to MultiQC, exactly like upstream |
 | softwareVersionsToYAML + collectFile | `multiqc_versions` | — | upstream extracts versions at runtime; port pins the module versions statically |
-| CAT_FASTQ | not ported | — | only active when a sample has >1 fastq pair; single-pair samplesheets cover the default path |
+| CAT_FASTQ | `cat_fastq_r1` / `cat_fastq_r2` | coreutils 9.5 | ported via the engine's `input_groups` primitive (issue #227, oxo-flow >= 0.17.0): one instance per sample with >1 fastq pair, R1s and R2s concatenated into `results/fastq/<sample>_R{1,2}.fastq.gz`; single-pair samples pass through unchanged (downstream falls back to the raw pair). Upstream's single process is split into two rules (one per read); see deviations |
 
 Additional notes: paired-end only (`single_end` samplesheet column is not
 ported); `--save_*` / `publish_dir_mode` params are N/A (oxo-flow publishes
@@ -250,6 +262,20 @@ outputs match upstream:
     branch's always-present files declared and the conditional extras
     (qualimap dirs, preseq logs, HS metrics, picard metrics) symlinked
     in-shell when they exist — the engine cannot declare conditional inputs.
+12. **CAT_FASTQ as two rules + a shell fallback** — upstream runs one
+    `CAT_FASTQ` process on `ch_samplesheet.multiple` and mixes its outputs
+    with `ch_samplesheet.single`. The port splits the merge into
+    `cat_fastq_r1` / `cat_fastq_r2` (the engine's `input_groups` allows one
+    pattern per rule — see the docs' "Input Groups" section), each
+    instantiating only for samples whose raw files carry a unit segment
+    (`<sample>_<unit>_R{1,2}.fastq.gz`), and the downstream
+    `fastqc`/`trimgalore` rules declare both the concatenated pair
+    (`optional = "any"`) and the raw pair, using the concatenated one when
+    it exists and the raw pair otherwise. Effective commands and outputs
+    match upstream (a sample named with a single unit is copied through —
+    `cat` of one file — which is the same content as the pass-through).
+    Needs oxo-flow >= 0.17.0; on older engines the `cat_fastq` rules fail
+    loudly instead of writing empty fastqs.
 
 ## Test
 
