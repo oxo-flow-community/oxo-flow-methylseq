@@ -59,7 +59,6 @@ name = "oxo-flow-methylseq"
 version = "1.0.0"
 description = "Bisulfite methylation analysis: FastQC, TrimGalore, alignment (bismark/bismark_hisat/bwameth/bwamem), deduplication, methylation calls (bismark/methyldackel/rastair), QC (qualimap/preseq), targeted-sequencing metrics, MultiQC"
 author = "oxo-flow-community"
-sample_group_name = "cohort"
 # Single-end reads (upstream samplesheet `single_end` column): uncomment and
 # set config.single_end_mode = true to route each sample by its row in
 # metadata/samples.tsv (the `endedness` column, SE or PE). The sheet is a
