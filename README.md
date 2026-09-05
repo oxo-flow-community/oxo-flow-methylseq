@@ -127,7 +127,12 @@ mem2 index variant (`use_mem2`), the optional branches (`taps`,
 `run_qualimap`, `run_preseq`, `run_targeted_sequencing`, `collecthsmetrics`,
 `bamqc_regions_file`, `target_regions_file`) and MethylDackel options
 (`all_contexts`, `merge_context`, `min_depth`, `ignore_flags`, `methyl_kit`).
-Every optional branch is off by default, matching the upstream defaults.
+Optional branches (`taps`, `run_qualimap`, `run_preseq`,
+`run_targeted_sequencing`, `collecthsmetrics`) are off by default, matching
+the upstream defaults. One documented divergence: `comprehensive` defaults
+to `true` (upstream: `false`) because the port's DAG consumes the merged
+(`--comprehensive`) Bismark methylation-call outputs — with the per-strand
+split files the declared rule outputs would be left unmoved.
 
 ### Single-end mode
 
