@@ -41,9 +41,13 @@ else
     for se_rule in fastqc_se trimgalore_se bismark_align_se bismark_deduplicate_se bismark_methylationextractor_se bismark_report_se; do
         grep -qE "${se_rule}_cohort_S3 +\[run:" /tmp/oxo-sedry-$$.txt
     done
-    # ... and the paired-end chain stays off
+    # ... and the paired-end chain stays off. Since engine 0.17.0 (#293/#239)
+    # when-false instances are pruned from the plan instead of being listed
+    # with [skip: when condition false], so assert they never run.
     for pe_rule in fastqc trimgalore bismark_align bismark_deduplicate bismark_methylationextractor bismark_report; do
-        grep -qE "${pe_rule}_cohort_S3 +\[skip" /tmp/oxo-sedry-$$.txt
+        if grep -qE "${pe_rule}_cohort_S3 +\[run:" /tmp/oxo-sedry-$$.txt; then
+            echo "FAIL: ${pe_rule}_cohort_S3 should not run in single-end mode"; exit 1
+        fi
     done
 fi
 
