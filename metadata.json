@@ -13,7 +13,16 @@
   },
   "created": "2026-08-15",
   "domain": "genomics",
-  "tags": ["bisulfite-seq", "wgbs", "dna-methylation", "bismark", "bwameth", "bwamem", "taps", "nf-core"],
+  "tags": [
+    "bisulfite-seq",
+    "wgbs",
+    "dna-methylation",
+    "bismark",
+    "bwameth",
+    "bwamem",
+    "taps",
+    "nf-core"
+  ],
   "scope": [
     "bismark_genomepreparation",
     "bismark_untar",
@@ -77,9 +86,32 @@
     "multiqc_bwameth",
     "multiqc_bwamem"
   ],
-  "excluded": [],
+  "excluded": [
+    "Parabricks fq2bammeth GPU alignment path (gpu profile; `PARABRICKS_FQ2BAMMETH` in fastq_align_dedup_bwameth + process_gpu accelerator) — not ported; the port runs bwameth on CPU only"
+  ],
   "rule_count": 61,
-  "tools": ["fastqc", "trim-galore", "cutadapt", "pigz", "bismark", "samtools", "htslib", "bwa", "bwameth", "picard", "methyldackel", "rastair", "qualimap", "preseq", "bedtools", "multiqc", "gzip", "tar", "coreutils", "r-base"],
+  "tools": [
+    "fastqc",
+    "trim-galore",
+    "cutadapt",
+    "pigz",
+    "bismark",
+    "samtools",
+    "htslib",
+    "bwa",
+    "bwameth",
+    "picard",
+    "methyldackel",
+    "rastair",
+    "qualimap",
+    "preseq",
+    "bedtools",
+    "multiqc",
+    "gzip",
+    "tar",
+    "coreutils",
+    "r-base"
+  ],
   "description": "Run end-to-end bisulfite methylation analysis (WGBS, and RRBS-compatible) of paired-end reads (default) and single-end reads (upstream single_end samplesheet column, via the engine metadata binding): FastQC quality control, TrimGalore adapter trimming, alignment to the bisulfite-converted reference genome with any of the four upstream aligners — Bismark bowtie2 (default), Bismark hisat2, bwameth (bwa-meth) or BWA-MEM — PCR-deduplication, samtools sort/index, methylation calls (bismark_methylation_extractor, MethylDackel on bwameth, rastair for TAPS), per-sample and project-wide Bismark HTML reports, optional QualiMap BamQC, preseq complexity estimates and targeted-sequencing (bedtools intersect + Picard HS metrics), and a final MultiQC report. All optional branches are gated on the same config keys as the upstream params and off by default.",
   "installation": {
     "engine": "oxo-flow >= 0.17.0",
