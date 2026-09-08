@@ -86,8 +86,9 @@
     "multiqc_bwameth",
     "multiqc_bwamem"
   ],
-  "excluded": [
-    "Parabricks fq2bammeth GPU alignment path (gpu profile; `PARABRICKS_FQ2BAMMETH` in fastq_align_dedup_bwameth + process_gpu accelerator) — not ported; the port runs bwameth on CPU only"
+  "excluded": [],
+  "not_applicable": [
+    "Parabricks fq2bammeth GPU alignment path (gpu profile; `PARABRICKS_FQ2BAMMETH` in fastq_align_dedup_bwameth + process_gpu accelerator) — not portable: NVIDIA Parabricks is a commercial GPU-licensed accelerator binary with no conda pin, outside the port's conda-portable tooling model; the conda-portable bwameth CPU path is ported and is the default"
   ],
   "rule_count": 61,
   "tools": [
