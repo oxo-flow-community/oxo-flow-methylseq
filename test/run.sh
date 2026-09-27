@@ -14,7 +14,7 @@ echo "==> lint (warnings are acceptable, errors are not)"
 echo "==> dry-run with default config"
 # oxo-flow v0.11.0 prints the plan to stderr; capture both streams
 "$OXO" dry-run main.oxoflow --samples first:1 > /tmp/oxo-dryrun-$$.txt 2>&1
-grep -q "would execute" /tmp/oxo-dryrun-$$.txt
+grep -qE "would (run|execute)" /tmp/oxo-dryrun-$$.txt
 
 echo "==> debug: expanded commands contain no literal {wildcards}"
 "$OXO" debug main.oxoflow 2>&1 | grep -q '{sample}' && { echo "unexpanded wildcards in debug output"; exit 1; } || true
@@ -36,7 +36,7 @@ else
         main.oxoflow > .se-tmp.oxoflow
     trap 'rm -f .se-tmp.oxoflow' EXIT
     "$OXO" dry-run .se-tmp.oxoflow --samples @test/fixtures/samples_se.tsv > /tmp/oxo-sedry-$$.txt 2>&1
-    grep -q "would execute" /tmp/oxo-sedry-$$.txt
+    grep -qE "would (run|execute)" /tmp/oxo-sedry-$$.txt
     # the single-end chain runs for S3 ...
     for se_rule in fastqc_se trimgalore_se bismark_align_se bismark_deduplicate_se bismark_methylationextractor_se bismark_report_se; do
         grep -qE "${se_rule}_cohort_S3 +\[run:" /tmp/oxo-sedry-$$.txt
